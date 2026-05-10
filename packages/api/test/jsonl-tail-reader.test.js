@@ -101,6 +101,23 @@ describe('readJsonlTail', () => {
     assert.equal(result, undefined, 'missing file should return undefined, not throw');
   });
 
+  test('respects maxBytes budget — bounds total bytes read from tail', () => {
+    // Build a ~512 KB jsonl: only entry at the very FRONT, padded user lines
+    // after. With a small maxBytes the tail reader must give up before
+    // reaching the front match.
+    const front = { type: 'gemini', content: 'oldest', tokens: { total: 4242 } };
+    const padding = Array.from({ length: 5000 }, (_, i) => ({
+      type: 'user',
+      content: `pad-${i}`.padEnd(100, 'x'),
+    }));
+    const path = makeJsonlFile([front, ...padding]);
+    const result = readJsonlTail(path, {
+      maxBytes: 16 * 1024, // 16 KiB — far less than the file size
+      predicate: (m) => m?.type === 'gemini' && typeof m?.tokens?.total === 'number',
+    });
+    assert.equal(result, undefined, 'must give up after maxBytes; should not read entire file to find front match');
+  });
+
   test('handles a large jsonl by reading from tail (sanity, not perf assertion)', () => {
     // ~5000 padded user lines + 1 gemini at the very end. Real perf assertion
     // (e.g. measuring fs.readSync invocations) is left for follow-up; here we
