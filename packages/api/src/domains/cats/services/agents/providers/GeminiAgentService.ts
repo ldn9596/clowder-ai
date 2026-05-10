@@ -18,7 +18,7 @@
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { type CatId, createCatId } from '@cat-cafe/shared';
@@ -34,10 +34,10 @@ import {
   spawnCli,
 } from '../../../../../utils/cli-spawn.js';
 import type { SpawnFn } from '../../../../../utils/cli-types.js';
+import { readJsonlTail } from '../../../../../utils/jsonl-tail-reader.js';
 import type { AgentMessage, AgentService, AgentServiceOptions, MessageMetadata, TokenUsage } from '../../types.js';
 import { appendLocalImagePathHints, collectImageAccessDirectories } from '../providers/image-cli-bridge.js';
 import { extractImagePaths } from '../providers/image-paths.js';
-import { readJsonlTail } from '../../../../../utils/jsonl-tail-reader.js';
 import { isKnownPostResponseCandidatesCrash, isResultErrorEvent, transformGeminiEvent } from './gemini-event-parser.js';
 
 const log = createModuleLogger('gemini-agent');
@@ -145,12 +145,66 @@ interface GeminiSessionFileLocation {
   readonly ext: '.json' | '.jsonl';
 }
 
+/** Max bytes scanned to extract the in-file sessionId header from a `.jsonl`. */
+const JSONL_HEADER_MAX_BYTES = 1024;
+
+/**
+ * Lightweight `.jsonl` header read: open fd, readSync up to 1 KiB, parse the
+ * first newline-terminated line as a JSON header `{ sessionId, ... }`.
+ *
+ * Critical: does NOT load the entire file. The previous implementation called
+ * `parseGeminiSessionFile` here, which `readFileSync`'d the whole multi-MB
+ * jsonl just to read its sessionId — defeating the reverse-tail optimization.
+ *
+ * Returns the header sessionId if present, or `undefined` (header missing,
+ * first line longer than 1 KiB, file unreadable, etc.) — the caller falls
+ * back to filename-prefix match.
+ */
+function readJsonlHeaderSessionId(filePath: string): string | undefined {
+  let fd: number;
+  try {
+    fd = openSync(filePath, 'r');
+  } catch {
+    return undefined;
+  }
+  try {
+    const buffer = Buffer.alloc(JSONL_HEADER_MAX_BYTES);
+    const n = readSync(fd, buffer, 0, JSONL_HEADER_MAX_BYTES, 0);
+    if (n === 0) return undefined;
+    const text = buffer.toString('utf8', 0, n);
+    const newlineIdx = text.indexOf('\n');
+    // First line must fit in JSONL_HEADER_MAX_BYTES; otherwise treat as missing.
+    if (newlineIdx === -1) return undefined;
+    const firstLine = text.substring(0, newlineIdx);
+    try {
+      const parsed = JSON.parse(firstLine) as { sessionId?: unknown; type?: unknown };
+      // A header row has sessionId and no message-style `type` field.
+      if (typeof parsed.sessionId === 'string' && typeof parsed.type === 'undefined') {
+        return parsed.sessionId;
+      }
+    } catch {
+      // First line not JSON-parseable — treat as missing header.
+    }
+    return undefined;
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
 /**
  * Locate Gemini's local session file for `sessionId`. Returns the file path +
  * extension, or `undefined` if no matching file is found.
  *
- * sessionId resolution priority: in-file header > filename prefix (fallback
- * for `.jsonl` when header is missing or unreadable).
+ * sessionId resolution priority for `.jsonl`:
+ *   1. lightweight header read (1 KiB) — preferred
+ *   2. filename prefix (first 8 chars of sessionId) — fallback when header missing
+ *
+ * For `.json` legacy files we still parse the whole document to read its
+ * `sessionId`; these files are small single-document JSON.
  *
  * Searches `~/.gemini/tmp/<projectDir>/chats/session-*.{json,jsonl}` —
  * preferring the project dir whose basename matches `workingDirectory`.
@@ -189,31 +243,20 @@ function findGeminiSessionFile(
       .sort((a, b) => b.mtimeMs - a.mtimeMs);
 
     for (const file of sessionFiles) {
-      const parsed = parseGeminiSessionFile(file.path, file.ext);
-      // Prefer in-file sessionId header. For .jsonl files where the header
-      // is missing/unreadable, accept filename-prefix match as a fallback.
-      const headerMatch = parsed.sessionId === sessionId;
-      const filenameMatch = file.ext === '.jsonl' && !parsed.sessionId && file.name.includes(sessionId.slice(0, 8));
-      if (!headerMatch && !filenameMatch) continue;
-      return { path: file.path, ext: file.ext };
+      if (file.ext === '.jsonl') {
+        // Lightweight header read (no full-file parse).
+        const headerSessionId = readJsonlHeaderSessionId(file.path);
+        const headerMatch = headerSessionId === sessionId;
+        const filenameMatch = headerSessionId == null && file.name.includes(sessionId.slice(0, 8));
+        if (headerMatch || filenameMatch) return { path: file.path, ext: '.jsonl' };
+      } else {
+        // .json legacy: small single-document JSON, full parse OK.
+        const parsed = parseGeminiSessionFile(file.path, '.json');
+        if (parsed.sessionId === sessionId) return { path: file.path, ext: '.json' };
+      }
     }
   }
   return undefined;
-}
-
-/**
- * Resolve the message list for `sessionId` (full-file parse). Used by thinking
- * extraction which needs broader breadth than just the latest match.
- */
-function readGeminiSessionMessages(
-  sessionId: string | undefined,
-  workingDirectory?: string,
-): readonly GeminiStoredMessage[] {
-  const location = findGeminiSessionFile(sessionId, workingDirectory);
-  if (!location) return [];
-  const parsed = parseGeminiSessionFile(location.path, location.ext);
-  if (!Array.isArray(parsed.messages)) return [];
-  return parsed.messages;
 }
 
 function readGeminiThinkingFromLocalSession(
@@ -221,9 +264,36 @@ function readGeminiThinkingFromLocalSession(
   assistantText: string,
   workingDirectory?: string,
 ): string | null {
-  const messages = readGeminiSessionMessages(sessionId, workingDirectory);
-  if (messages.length === 0) return null;
+  const location = findGeminiSessionFile(sessionId, workingDirectory);
+  if (!location) return null;
 
+  const normalizedAssistantText = normalizeGeminiContent(assistantText);
+
+  // Predicate: a `gemini`-type message with non-empty thoughts. Content match
+  // when assistantText is provided; otherwise (tool-only paths) take the
+  // tail-most message with thoughts.
+  const matchesThoughts = (parsed: unknown): boolean => {
+    if (parsed == null || typeof parsed !== 'object') return false;
+    const m = parsed as GeminiStoredMessage;
+    if (m.type !== 'gemini') return false;
+    if (!Array.isArray(m.thoughts) || m.thoughts.length === 0) return false;
+    if (typeof m.content !== 'string') return false;
+    if (normalizedAssistantText.length === 0) return true;
+    return normalizeGeminiContent(m.content) === normalizedAssistantText;
+  };
+
+  // Fast path for `.jsonl`: reverse-tail reader stops at the first match
+  // from EOF. Avoids loading the whole multi-megabyte session into memory
+  // on every model turn (Gemini hot path runs once per invocation).
+  if (location.ext === '.jsonl') {
+    const match = readJsonlTail<GeminiStoredMessage>(location.path, { predicate: matchesThoughts });
+    if (!match) return null;
+    return formatGeminiThoughts(match.thoughts ?? []) || null;
+  }
+
+  // Legacy `.json` path: full-file parse + reverse find. Files are small.
+  const parsed = parseGeminiSessionFile(location.path, '.json');
+  const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
   const candidates = messages.filter(
     (message): message is GeminiStoredMessage =>
       message?.type === 'gemini' &&
@@ -232,8 +302,6 @@ function readGeminiThinkingFromLocalSession(
       typeof message.content === 'string',
   );
   if (candidates.length === 0) return null;
-
-  const normalizedAssistantText = normalizeGeminiContent(assistantText);
   const exact =
     normalizedAssistantText.length > 0
       ? [...candidates].reverse().find((message) => normalizeGeminiContent(message.content) === normalizedAssistantText)
