@@ -256,7 +256,7 @@ export function SessionChainPanel({ threadId, catInvocations, onViewSession }: S
               {usage && (usage.inputTokens != null || usage.outputTokens != null) && (
                 <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[10px] font-mono mb-1">
                   {usage.inputTokens != null && (
-                    <span className="text-cafe-secondary">
+                    <span className="text-cafe-secondary" title="CLI-reported cumulative input / not context fill">
                       {fmtTokens(usage.inputTokens)}
                       <span className="text-cafe-muted ml-0.5">↓</span>
                     </span>
