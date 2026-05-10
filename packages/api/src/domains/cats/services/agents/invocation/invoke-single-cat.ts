@@ -1517,7 +1517,20 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
                   const isAnthropicApiKey = provider === 'anthropic' && profileMode === ANTHROPIC_PROFILE_MODE_API_KEY;
                   const skipAutoSealForApproxApiKey = isAnthropicApiKey && health.source === 'approx';
                   const skipAutoSealForApiKeyCompress = isAnthropicApiKey && strategy.strategy === 'compress';
-                  if (!skipAutoSealForApproxApiKey && !skipAutoSealForApiKeyCompress) {
+                  // Gemini CLI's stream stats are session-level cumulative, not per-turn.
+                  // When usedFrom !== 'last_turn' for a google provider, fillRatio is
+                  // computed from cumulative inputTokens/totalTokens which inflate
+                  // beyond windowSize and cap at 1.0 → spurious auto-seal.
+                  // GeminiAgentService injects per-turn lastTurnInputTokens from local
+                  // jsonl when possible; if it could not (assistantText empty / no
+                  // matching local message / jsonl unavailable), skip auto-seal here
+                  // and keep context_health as observability only.
+                  const skipAutoSealForGeminiCumulative = provider === 'google' && usedFrom !== 'last_turn';
+                  if (
+                    !skipAutoSealForApproxApiKey &&
+                    !skipAutoSealForApiKeyCompress &&
+                    !skipAutoSealForGeminiCumulative
+                  ) {
                     const activeRecord = await deps.sessionChainStore.getActive(catId, threadId);
                     const action = shouldTakeAction(
                       health.fillRatio,
