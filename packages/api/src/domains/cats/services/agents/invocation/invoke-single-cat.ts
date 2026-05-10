@@ -1550,7 +1550,7 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
                       },
                       'Gemini auto-seal skipped: no per-turn lastTurnInputTokens; running on cumulative usage only',
                     );
-                    geminiContextFallback.add(1, { 'agent.id': catId, reason: 'no_per_turn_signal' });
+                    geminiContextFallback.add(1, { [AGENT_ID]: catId, [TRIGGER]: 'no_per_turn_signal' });
                   }
                   if (
                     !skipAutoSealForApproxApiKey &&
