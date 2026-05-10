@@ -65,7 +65,10 @@ export function ContextHealthBar({
 
   const approxPrefix = health.source === 'approx' ? '~' : '';
   const percent = Math.round(health.fillRatio * 100);
-  const tooltip = `Context: ${approxPrefix}${percent}% (${formatTokenCount(health.usedTokens)} / ${formatTokenCount(health.windowTokens)} tokens)`;
+  // "Current context fill:" prefix (vs the SessionChainPanel ↓ widget which
+  // shows CLI-reported cumulative input) clarifies that the bar reflects
+  // per-turn context usage. See UI spec U-A+ for rationale.
+  const tooltip = `Current context fill: ${approxPrefix}${percent}% (${formatTokenCount(health.usedTokens)} / ${formatTokenCount(health.windowTokens)} tokens)`;
 
   return (
     <div className="mt-1" title={tooltip} data-testid={`context-health-${catId}`}>
