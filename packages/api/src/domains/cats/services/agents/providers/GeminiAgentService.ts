@@ -48,10 +48,20 @@ interface GeminiStoredThought {
   readonly description?: string;
 }
 
+interface GeminiStoredTokenStats {
+  readonly total?: number;
+  readonly input?: number;
+  readonly output?: number;
+  readonly cached?: number;
+  readonly thoughts?: number;
+  readonly tool?: number;
+}
+
 interface GeminiStoredMessage {
   readonly type?: string;
   readonly content?: string;
   readonly thoughts?: readonly GeminiStoredThought[];
+  readonly tokens?: GeminiStoredTokenStats;
 }
 
 interface GeminiStoredSession {
@@ -77,15 +87,64 @@ function formatGeminiThoughts(thoughts: readonly GeminiStoredThought[]): string 
     .join('\n\n---\n\n');
 }
 
-function readGeminiThinkingFromLocalSession(
+/**
+ * Parse one Gemini session file. Supports both legacy `.json` (whole-file
+ * `{sessionId, messages: [...]}`) and current `.jsonl` (line-by-line: header
+ * row with `sessionId`, `$set` update rows to skip, then individual messages).
+ *
+ * Returns the resolved sessionId (in-file header preferred) and the message
+ * list. On any parse error returns `{ messages: [] }`.
+ */
+function parseGeminiSessionFile(filePath: string, ext: '.json' | '.jsonl'): GeminiStoredSession {
+  try {
+    const raw = readFileSync(filePath, 'utf8');
+    if (ext === '.json') {
+      return JSON.parse(raw) as GeminiStoredSession;
+    }
+    // .jsonl
+    let sessionId: string | undefined;
+    const messages: GeminiStoredMessage[] = [];
+    for (const line of raw.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      try {
+        const obj = JSON.parse(line) as Record<string, unknown>;
+        // Header row: has sessionId but no message-like `type`
+        if (typeof obj.sessionId === 'string' && typeof obj.type === 'undefined') {
+          sessionId = sessionId ?? (obj.sessionId as string);
+          continue;
+        }
+        // Mongo-style update row, skip
+        if (Object.hasOwn(obj, '$set')) continue;
+        // Message row
+        if (typeof obj.type === 'string') {
+          messages.push(obj as unknown as GeminiStoredMessage);
+        }
+      } catch {
+        // Skip a malformed/partial line while Gemini is still writing.
+      }
+    }
+    return { sessionId, messages };
+  } catch {
+    return { messages: [] };
+  }
+}
+
+/**
+ * Locate Gemini's local session file for `sessionId` and return its message
+ * list. sessionId resolution priority: in-file header > filename prefix
+ * (fallback for .jsonl when header is missing or unreadable).
+ *
+ * Searches `~/.gemini/tmp/<projectDir>/chats/session-*.{json,jsonl}` —
+ * preferring the project dir whose basename matches `workingDirectory`.
+ */
+function readGeminiSessionMessages(
   sessionId: string | undefined,
-  assistantText: string,
   workingDirectory?: string,
-): string | null {
-  if (!sessionId) return null;
+): readonly GeminiStoredMessage[] {
+  if (!sessionId) return [];
 
   const geminiTmpRoot = join(homedir(), '.gemini', 'tmp');
-  if (!existsSync(geminiTmpRoot)) return null;
+  if (!existsSync(geminiTmpRoot)) return [];
 
   const preferredProjectDir = workingDirectory ? basename(workingDirectory) : null;
   const projectDirs = readdirSync(geminiTmpRoot, { withFileTypes: true })
@@ -97,49 +156,100 @@ function readGeminiThinkingFromLocalSession(
       return 0;
     });
 
-  const normalizedAssistantText = normalizeGeminiContent(assistantText);
-
   for (const projectDir of projectDirs) {
     const chatsDir = join(geminiTmpRoot, projectDir, 'chats');
     if (!existsSync(chatsDir)) continue;
 
     const sessionFiles = readdirSync(chatsDir)
-      .filter((name) => name.startsWith('session-') && name.endsWith('.json'))
+      .filter((name) => name.startsWith('session-') && (name.endsWith('.json') || name.endsWith('.jsonl')))
       .map((name) => ({
         path: join(chatsDir, name),
+        ext: (name.endsWith('.jsonl') ? '.jsonl' : '.json') as '.json' | '.jsonl',
+        name,
         mtimeMs: statSync(join(chatsDir, name)).mtimeMs,
       }))
       .sort((a, b) => b.mtimeMs - a.mtimeMs);
 
     for (const file of sessionFiles) {
-      try {
-        const parsed = JSON.parse(readFileSync(file.path, 'utf8')) as GeminiStoredSession;
-        if (parsed.sessionId !== sessionId || !Array.isArray(parsed.messages)) continue;
-
-        const candidates = parsed.messages.filter(
-          (message): message is GeminiStoredMessage =>
-            message?.type === 'gemini' &&
-            Array.isArray(message.thoughts) &&
-            message.thoughts.length > 0 &&
-            typeof message.content === 'string',
-        );
-        if (candidates.length === 0) return null;
-
-        const exact =
-          normalizedAssistantText.length > 0
-            ? [...candidates]
-                .reverse()
-                .find((message) => normalizeGeminiContent(message.content) === normalizedAssistantText)
-            : candidates[candidates.length - 1];
-        const selected = exact ?? null;
-        return selected ? formatGeminiThoughts(selected.thoughts ?? []) || null : null;
-      } catch {
-        // Best effort: skip malformed/partial session files while Gemini is still writing them.
-      }
+      const parsed = parseGeminiSessionFile(file.path, file.ext);
+      // Prefer in-file sessionId header. For .jsonl files where the header
+      // is missing/unreadable, accept filename-prefix match as a fallback.
+      const headerMatch = parsed.sessionId === sessionId;
+      const filenameMatch = file.ext === '.jsonl' && !parsed.sessionId && file.name.includes(sessionId.slice(0, 8));
+      if (!headerMatch && !filenameMatch) continue;
+      if (!Array.isArray(parsed.messages)) continue;
+      return parsed.messages;
     }
   }
+  return [];
+}
 
-  return null;
+function readGeminiThinkingFromLocalSession(
+  sessionId: string | undefined,
+  assistantText: string,
+  workingDirectory?: string,
+): string | null {
+  const messages = readGeminiSessionMessages(sessionId, workingDirectory);
+  if (messages.length === 0) return null;
+
+  const candidates = messages.filter(
+    (message): message is GeminiStoredMessage =>
+      message?.type === 'gemini' &&
+      Array.isArray(message.thoughts) &&
+      message.thoughts.length > 0 &&
+      typeof message.content === 'string',
+  );
+  if (candidates.length === 0) return null;
+
+  const normalizedAssistantText = normalizeGeminiContent(assistantText);
+  const exact =
+    normalizedAssistantText.length > 0
+      ? [...candidates].reverse().find((message) => normalizeGeminiContent(message.content) === normalizedAssistantText)
+      : candidates[candidates.length - 1];
+  const selected = exact ?? null;
+  return selected ? formatGeminiThoughts(selected.thoughts ?? []) || null : null;
+}
+
+/**
+ * Returns the per-turn `tokens.total` from the LATEST gemini-type message in
+ * the local session whose normalized content matches `assistantText`.
+ *
+ * Returns `undefined` when:
+ *   - assistantText is empty (tool-only paths — caller decides fallback)
+ *   - no matching message found (do NOT degrade to latest unconditionally —
+ *     this is the safe path: caller will then disable auto-seal rather than
+ *     act on a wrong context-fill estimate)
+ *
+ * Used to populate `metadata.usage.lastTurnInputTokens` so invoke-single-cat's
+ * fillRatio uses per-turn context size instead of cumulative session metrics
+ * from Gemini CLI's `result.stats` (which would otherwise spuriously trigger
+ * a 100% seal).
+ */
+function readLatestGeminiContextTokens(
+  sessionId: string | undefined,
+  assistantText: string,
+  workingDirectory?: string,
+): number | undefined {
+  const normalizedAssistantText = normalizeGeminiContent(assistantText);
+  if (normalizedAssistantText.length === 0) return undefined;
+
+  const messages = readGeminiSessionMessages(sessionId, workingDirectory);
+  if (messages.length === 0) return undefined;
+
+  const candidates = messages.filter(
+    (message): message is GeminiStoredMessage =>
+      message?.type === 'gemini' && typeof message.content === 'string' && typeof message.tokens?.total === 'number',
+  );
+  if (candidates.length === 0) return undefined;
+
+  // Walk in reverse to pick the LATEST matching message (handles streamed
+  // duplicate rows where Gemini CLI rewrites the same message id with
+  // updated tokens).
+  const exact = [...candidates]
+    .reverse()
+    .find((message) => normalizeGeminiContent(message.content) === normalizedAssistantText);
+
+  return exact?.tokens?.total;
 }
 /**
  * Options for constructing GeminiAgentService (dependency injection)
@@ -388,6 +498,17 @@ export class GeminiAgentService implements AgentService {
           metadata,
           timestamp: Date.now(),
         };
+      }
+
+      // Inject per-turn tokens.total as lastTurnInputTokens so invoke-single-cat
+      // uses the correct context-fill numerator (vs Gemini CLI's cumulative stats).
+      const lastTurnTokens = readLatestGeminiContextTokens(
+        metadata.sessionId,
+        fullAssistantText,
+        options?.workingDirectory,
+      );
+      if (lastTurnTokens != null) {
+        metadata.usage = { ...(metadata.usage ?? {}), lastTurnInputTokens: lastTurnTokens };
       }
 
       yield { type: 'done', catId: this.catId, metadata, timestamp: Date.now() };
