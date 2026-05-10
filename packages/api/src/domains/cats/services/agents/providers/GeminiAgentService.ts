@@ -37,6 +37,7 @@ import type { SpawnFn } from '../../../../../utils/cli-types.js';
 import type { AgentMessage, AgentService, AgentServiceOptions, MessageMetadata, TokenUsage } from '../../types.js';
 import { appendLocalImagePathHints, collectImageAccessDirectories } from '../providers/image-cli-bridge.js';
 import { extractImagePaths } from '../providers/image-paths.js';
+import { readJsonlTail } from '../../../../../utils/jsonl-tail-reader.js';
 import { isKnownPostResponseCandidatesCrash, isResultErrorEvent, transformGeminiEvent } from './gemini-event-parser.js';
 
 const log = createModuleLogger('gemini-agent');
@@ -129,22 +130,29 @@ function parseGeminiSessionFile(filePath: string, ext: '.json' | '.jsonl'): Gemi
   }
 }
 
+interface GeminiSessionFileLocation {
+  readonly path: string;
+  readonly ext: '.json' | '.jsonl';
+}
+
 /**
- * Locate Gemini's local session file for `sessionId` and return its message
- * list. sessionId resolution priority: in-file header > filename prefix
- * (fallback for .jsonl when header is missing or unreadable).
+ * Locate Gemini's local session file for `sessionId`. Returns the file path +
+ * extension, or `undefined` if no matching file is found.
+ *
+ * sessionId resolution priority: in-file header > filename prefix (fallback
+ * for `.jsonl` when header is missing or unreadable).
  *
  * Searches `~/.gemini/tmp/<projectDir>/chats/session-*.{json,jsonl}` —
  * preferring the project dir whose basename matches `workingDirectory`.
  */
-function readGeminiSessionMessages(
+function findGeminiSessionFile(
   sessionId: string | undefined,
   workingDirectory?: string,
-): readonly GeminiStoredMessage[] {
-  if (!sessionId) return [];
+): GeminiSessionFileLocation | undefined {
+  if (!sessionId) return undefined;
 
   const geminiTmpRoot = join(homedir(), '.gemini', 'tmp');
-  if (!existsSync(geminiTmpRoot)) return [];
+  if (!existsSync(geminiTmpRoot)) return undefined;
 
   const preferredProjectDir = workingDirectory ? basename(workingDirectory) : null;
   const projectDirs = readdirSync(geminiTmpRoot, { withFileTypes: true })
@@ -177,11 +185,25 @@ function readGeminiSessionMessages(
       const headerMatch = parsed.sessionId === sessionId;
       const filenameMatch = file.ext === '.jsonl' && !parsed.sessionId && file.name.includes(sessionId.slice(0, 8));
       if (!headerMatch && !filenameMatch) continue;
-      if (!Array.isArray(parsed.messages)) continue;
-      return parsed.messages;
+      return { path: file.path, ext: file.ext };
     }
   }
-  return [];
+  return undefined;
+}
+
+/**
+ * Resolve the message list for `sessionId` (full-file parse). Used by thinking
+ * extraction which needs broader breadth than just the latest match.
+ */
+function readGeminiSessionMessages(
+  sessionId: string | undefined,
+  workingDirectory?: string,
+): readonly GeminiStoredMessage[] {
+  const location = findGeminiSessionFile(sessionId, workingDirectory);
+  if (!location) return [];
+  const parsed = parseGeminiSessionFile(location.path, location.ext);
+  if (!Array.isArray(parsed.messages)) return [];
+  return parsed.messages;
 }
 
 function readGeminiThinkingFromLocalSession(
@@ -233,22 +255,38 @@ function readLatestGeminiContextTokens(
   const normalizedAssistantText = normalizeGeminiContent(assistantText);
   if (normalizedAssistantText.length === 0) return undefined;
 
-  const messages = readGeminiSessionMessages(sessionId, workingDirectory);
-  if (messages.length === 0) return undefined;
+  const location = findGeminiSessionFile(sessionId, workingDirectory);
+  if (!location) return undefined;
 
+  // Predicate matches a `gemini`-type message with a numeric tokens.total
+  // whose normalized content equals the current assistant text.
+  const matchesAssistantText = (parsed: unknown): boolean => {
+    if (parsed == null || typeof parsed !== 'object') return false;
+    const m = parsed as GeminiStoredMessage;
+    if (m.type !== 'gemini' || typeof m.content !== 'string' || typeof m.tokens?.total !== 'number') return false;
+    return normalizeGeminiContent(m.content) === normalizedAssistantText;
+  };
+
+  // Fast path for `.jsonl`: reverse-tail reader stops at the first match
+  // from EOF. Avoids loading the whole multi-megabyte session into memory
+  // on every model turn. See utils/jsonl-tail-reader.ts.
+  if (location.ext === '.jsonl') {
+    const match = readJsonlTail<GeminiStoredMessage>(location.path, { predicate: matchesAssistantText });
+    return match?.tokens?.total;
+  }
+
+  // Legacy `.json` path: full-file parse + reverse find. Historical Gemini
+  // CLI output was a single JSON document; these files are typically small
+  // and rare enough that perf optimization isn't justified.
+  const parsed = parseGeminiSessionFile(location.path, location.ext);
+  const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
   const candidates = messages.filter(
     (message): message is GeminiStoredMessage =>
       message?.type === 'gemini' && typeof message.content === 'string' && typeof message.tokens?.total === 'number',
   );
-  if (candidates.length === 0) return undefined;
-
-  // Walk in reverse to pick the LATEST matching message (handles streamed
-  // duplicate rows where Gemini CLI rewrites the same message id with
-  // updated tokens).
   const exact = [...candidates]
     .reverse()
     .find((message) => normalizeGeminiContent(message.content) === normalizedAssistantText);
-
   return exact?.tokens?.total;
 }
 /**
