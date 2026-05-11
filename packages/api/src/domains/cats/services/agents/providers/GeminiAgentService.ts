@@ -84,6 +84,42 @@ function normalizeGeminiContent(value: string | undefined): string {
   return (value ?? '').replace(/\s+/g, '');
 }
 
+/**
+ * Does a jsonl message's content correspond to (the tail of) the current
+ * assistant text? Accepts either strict equality OR suffix-match — i.e.
+ * `normalizedAssistantText.endsWith(normalizedMessageContent)`.
+ *
+ * The suffix branch handles a real-world Gemini CLI shape (observed
+ * 2026-05-11): when the model thinks before producing a final reply, the
+ * CLI emits MULTIPLE `message/assistant` events — one per thinking step
+ * plus one final text. GeminiAgentService stitches them with `\n\n` into
+ * `fullAssistantText`, so the assembled string looks like
+ * `**Thinking step 1**\n\n**Thinking step 2**\n\nfinal text`. The jsonl,
+ * however, stores ONE row per logical step (each thinking step + the
+ * final each in its own row), so the final row's content equals only
+ * the "final text" tail. Strict equality would miss it; checking that
+ * the assistantText *ends with* the candidate row's normalized content
+ * recovers the match without falling back to cumulative tokens.
+ *
+ * Why suffix (not arbitrary substring): Gemini CLI's per-step output is
+ * the LAST piece appended for that step; for the final row we want it
+ * to live at the END of the stitched assistant text. Forward/middle
+ * substring would also match thinking-rows whose text appears as a
+ * prefix or middle slice — those have STALE tokens.input (computed
+ * before later steps' prompts were sent), so we must not pick them up.
+ *
+ * Returns `false` for empty `messageContent` or non-string content, so
+ * the caller can still distinguish "no usable content" from a match.
+ */
+function matchesCurrentAssistantText(messageContent: string | undefined, normalizedAssistantText: string): boolean {
+  if (typeof messageContent !== 'string') return false;
+  const normalizedMessageContent = normalizeGeminiContent(messageContent);
+  if (normalizedMessageContent.length === 0) return false;
+  return (
+    normalizedMessageContent === normalizedAssistantText || normalizedAssistantText.endsWith(normalizedMessageContent)
+  );
+}
+
 function formatGeminiThoughts(thoughts: readonly GeminiStoredThought[]): string {
   return thoughts
     .map((thought) => {
@@ -270,8 +306,11 @@ function readGeminiThinkingFromLocalSession(
   const normalizedAssistantText = normalizeGeminiContent(assistantText);
 
   // Predicate: a `gemini`-type message with non-empty thoughts. Content match
-  // when assistantText is provided; otherwise (tool-only paths) take the
-  // tail-most message with thoughts.
+  // when assistantText is provided (uses `matchesCurrentAssistantText`, which
+  // accepts strict equality OR suffix-match — see helper docstring for why
+  // suffix-match is necessary when the model thinks first and final text is
+  // only the tail of the stitched fullAssistantText). Empty assistantText
+  // (tool-only paths) takes the tail-most message with thoughts.
   const matchesThoughts = (parsed: unknown): boolean => {
     if (parsed == null || typeof parsed !== 'object') return false;
     const m = parsed as GeminiStoredMessage;
@@ -279,7 +318,7 @@ function readGeminiThinkingFromLocalSession(
     if (!Array.isArray(m.thoughts) || m.thoughts.length === 0) return false;
     if (typeof m.content !== 'string') return false;
     if (normalizedAssistantText.length === 0) return true;
-    return normalizeGeminiContent(m.content) === normalizedAssistantText;
+    return matchesCurrentAssistantText(m.content, normalizedAssistantText);
   };
 
   // Fast path for `.jsonl`: reverse-tail reader stops at the first match
@@ -304,32 +343,39 @@ function readGeminiThinkingFromLocalSession(
   if (candidates.length === 0) return null;
   const exact =
     normalizedAssistantText.length > 0
-      ? [...candidates].reverse().find((message) => normalizeGeminiContent(message.content) === normalizedAssistantText)
+      ? [...candidates]
+          .reverse()
+          .find((message) => matchesCurrentAssistantText(message.content, normalizedAssistantText))
       : candidates[candidates.length - 1];
   const selected = exact ?? null;
   return selected ? formatGeminiThoughts(selected.thoughts ?? []) || null : null;
 }
 
 /**
- * Returns the per-turn `tokens.total` from the LATEST gemini-type message in
+ * Returns the per-turn `tokens.input` from the LATEST gemini-type message in
  * the local session.
  *
  * Resolution strategy:
- *   - assistantText non-empty: strict normalized-content match (walks
- *     candidates in reverse, picks LATEST match). When the model emits both
- *     thinking rows and a final assistant text row, only the final row
- *     matches, so this remains safe across multiple turns sharing one
- *     sessionId-bound jsonl.
+ *   - assistantText non-empty: normalized-content match via
+ *     `matchesCurrentAssistantText` (strict equality OR suffix-match — see
+ *     helper docstring for why suffix-match is required to handle the
+ *     thinking-prefix shape where multiple thinking messages plus a final
+ *     are stitched into one fullAssistantText but stored as separate jsonl
+ *     rows). Walks candidates in reverse, picks LATEST match.
  *   - assistantText empty (tool-only turn — model produced no user-visible
  *     text, only thinking + tool_use): fall back to the tail-most candidate.
- *     This is safe because sessionId already uniquely scopes the jsonl, and
- *     the tail-most message is THIS turn's latest (Gemini CLI flushes the
- *     turn's rows before invokeGeminiCLI yields done). Without this fallback
- *     tool-only turns get no `lastTurnInputTokens` and fillRatio silently
- *     degrades back to cumulative inputTokens.
- *   - non-empty assistantText that matches no jsonl row: undefined. The
- *     caller (`invoke-single-cat`) treats undefined as "skip auto-seal";
- *     this is the safe path versus picking a wrong message.
+ *     Safe because sessionId already uniquely scopes the jsonl, and the
+ *     tail-most message IS this turn's latest (Gemini CLI flushes the turn's
+ *     rows before invokeGeminiCLI yields done).
+ *   - non-empty assistantText that matches no jsonl row: undefined (caller
+ *     treats undefined as "skip auto-seal"; safer than picking a wrong row).
+ *
+ * Why `tokens.input`, not `tokens.total`: the metadata field is named
+ * `lastTurnInputTokens` and the UI's `ContextHealthBar` expects an input-only
+ * value for `usedTokens / windowSize`. `tokens.total` also includes output
+ * and thinking, which makes the per-turn bar overshoot the cumulative
+ * `usage.inputTokens` widget on single-turn invocations (LD reported
+ * "↓ 92k < 进度条 98k" on 2026-05-11 — Bug A in the analysis md).
  *
  * Used to populate `metadata.usage.lastTurnInputTokens` so invoke-single-cat's
  * fillRatio uses per-turn context size instead of cumulative session metrics
@@ -347,30 +393,33 @@ function readLatestGeminiContextTokens(
   const normalizedAssistantText = normalizeGeminiContent(assistantText);
 
   // Two predicates share both the fast (.jsonl) and legacy (.json) paths.
-  // - hasTokens: any gemini-type row with numeric tokens.total. Used for
-  //   tool-only turns (empty assistantText) — the tail-most such row IS
+  // - hasInputTokens: any gemini-type row with numeric tokens.input. Used
+  //   for tool-only turns (empty assistantText) — the tail-most such row IS
   //   this turn's latest message (sessionId already scopes the file).
-  // - matchesAssistantText: stricter — also requires normalized content
-  //   to equal the current assistant text. Used when assistantText is
-  //   non-empty so we don't misattribute tokens across turns.
-  const hasTokens = (parsed: unknown): parsed is GeminiStoredMessage => {
+  //   We check tokens.input (not tokens.total) so a row missing input never
+  //   silently degrades to total.
+  // - matchesAssistantText: stricter — also requires normalized content to
+  //   correspond to current assistant text (strict equality OR suffix-match,
+  //   per matchesCurrentAssistantText). Used when assistantText is non-empty
+  //   so we don't misattribute tokens across turns.
+  const hasInputTokens = (parsed: unknown): parsed is GeminiStoredMessage => {
     if (parsed == null || typeof parsed !== 'object') return false;
     const m = parsed as GeminiStoredMessage;
-    return m.type === 'gemini' && typeof m.tokens?.total === 'number';
+    return m.type === 'gemini' && typeof m.tokens?.input === 'number';
   };
   const matchesAssistantText = (parsed: unknown): boolean => {
-    if (!hasTokens(parsed)) return false;
+    if (!hasInputTokens(parsed)) return false;
     const m = parsed as GeminiStoredMessage;
-    return typeof m.content === 'string' && normalizeGeminiContent(m.content) === normalizedAssistantText;
+    return matchesCurrentAssistantText(m.content, normalizedAssistantText);
   };
 
   // Fast path for `.jsonl`: reverse-tail reader stops at the first match
   // from EOF. Avoids loading the whole multi-megabyte session into memory
   // on every model turn. See utils/jsonl-tail-reader.ts.
   if (location.ext === '.jsonl') {
-    const predicate = normalizedAssistantText.length === 0 ? hasTokens : matchesAssistantText;
+    const predicate = normalizedAssistantText.length === 0 ? hasInputTokens : matchesAssistantText;
     const match = readJsonlTail<GeminiStoredMessage>(location.path, { predicate });
-    return match?.tokens?.total;
+    return match?.tokens?.input;
   }
 
   // Legacy `.json` path: full-file parse + reverse find. Historical Gemini
@@ -378,24 +427,21 @@ function readLatestGeminiContextTokens(
   // and rare enough that perf optimization isn't justified.
   const parsed = parseGeminiSessionFile(location.path, location.ext);
   const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
-  const candidates = messages.filter(hasTokens);
+  const candidates = messages.filter(hasInputTokens);
   if (candidates.length === 0) return undefined;
 
   if (normalizedAssistantText.length === 0) {
     // Tool-only turn: tail-most candidate IS this turn's latest message.
-    return candidates[candidates.length - 1].tokens?.total;
+    return candidates[candidates.length - 1].tokens?.input;
   }
 
   // Walk in reverse to pick the LATEST matching message (handles streamed
   // duplicate rows where Gemini CLI rewrites the same message id with
-  // updated tokens).
+  // updated tokens, AND the thinking-prefix shape via suffix-match).
   const exact = [...candidates]
     .reverse()
-    .find(
-      (message) =>
-        typeof message.content === 'string' && normalizeGeminiContent(message.content) === normalizedAssistantText,
-    );
-  return exact?.tokens?.total;
+    .find((message) => matchesCurrentAssistantText(message.content, normalizedAssistantText));
+  return exact?.tokens?.input;
 }
 /**
  * Options for constructing GeminiAgentService (dependency injection)
