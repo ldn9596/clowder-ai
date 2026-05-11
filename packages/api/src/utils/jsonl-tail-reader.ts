@@ -4,9 +4,9 @@
  * Reads a JSONL file from EOF backward, parsing entries one at a time
  * (most-recent first), and returns the first entry that matches `predicate`.
  *
- * Designed for the Gemini per-turn `tokens.total` use case: the local
- * Gemini CLI session jsonl can grow to multi-megabyte sizes, but we only
- * ever need the latest matching message. Loading the whole file with
+ * Designed for the Gemini per-turn token lookup: the local Gemini CLI
+ * session jsonl can grow to multi-megabyte sizes, but we only ever need
+ * the latest matching message. Loading the whole file with
  * `readFileSync + split('\n')` on every model turn would block the Node.js
  * event loop. This helper opens an fd, reads small chunks from the tail,
  * and stops as soon as a match is found OR a budget is exhausted.

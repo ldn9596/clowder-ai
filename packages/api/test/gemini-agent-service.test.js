@@ -963,7 +963,7 @@ test('prefers latest matching gemini message when same content appears multiple 
 
     emitGeminiEvents(proc, [
       { type: 'init', session_id: 'test-session-uuid-001', model: 'gemini-test' },
-      // Content matches both msg-004 occurrences (line 6: total=125, line 8: total=130)
+      // Content matches both msg-004 occurrences (line 6: input=100, line 8: input=105)
       { type: 'message', role: 'assistant', content: 'Here is more info about the topic', delta: true },
       { type: 'result', status: 'success', stats: { total_tokens: 200 } },
     ]);

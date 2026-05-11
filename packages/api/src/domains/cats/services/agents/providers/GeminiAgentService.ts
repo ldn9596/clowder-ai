@@ -692,7 +692,7 @@ export class GeminiAgentService implements AgentService {
         };
       }
 
-      // Inject per-turn tokens.total as lastTurnInputTokens so invoke-single-cat
+      // Inject per-turn tokens.input as lastTurnInputTokens so invoke-single-cat
       // uses the correct context-fill numerator (vs Gemini CLI's cumulative stats).
       const lastTurnTokens = readLatestGeminiContextTokens(
         metadata.sessionId,
