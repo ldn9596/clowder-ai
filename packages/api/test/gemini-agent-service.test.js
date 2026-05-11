@@ -1018,6 +1018,56 @@ test('does not fall back to latest message when assistant text matches no jsonl 
   }
 });
 
+test('injects lastTurnInputTokens for tool-only turn (no message/assistant event, fullAssistantText empty)', async () => {
+  // Repro of runtime bug observed 2026-05-11 endurance run: when Gemini CLI
+  // performs a turn that produces ONLY thinking + tool_use (no
+  // message/assistant event), GeminiAgentService leaves `fullAssistantText`
+  // empty. Previously the empty-assistantText guard in
+  // readLatestGeminiContextTokens returned undefined unconditionally — so
+  // tool-only turns silently degraded to cumulative inputTokens (UI's ↓
+  // widget == ContextHealthBar number).
+  // Fix: empty assistantText falls back to tail-most jsonl candidate, which
+  // IS this turn's latest message (sessionId-bound, CLI flushed before done).
+  const proc = createMockProcess();
+  const spawnFn = createMockSpawnFn(proc);
+  const service = new GeminiAgentService({ spawnFn, adapter: 'gemini-cli' });
+
+  const fakeHome = mkdtempSync(join(tmpdir(), 'gemini-home-'));
+  const sessionDir = join(fakeHome, '.gemini', 'tmp', 'clowder-ai', 'chats');
+  mkdirSync(sessionDir, { recursive: true });
+  const previousHome = process.env.HOME;
+  process.env.HOME = fakeHome;
+
+  try {
+    const fixturePath = join(import.meta.dirname, 'fixtures', 'gemini-session-with-tokens.jsonl');
+    const jsonlContent = readFileSync(fixturePath, 'utf8');
+    writeFileSync(join(sessionDir, 'session-2026-05-09T01-00-test001.jsonl'), jsonlContent);
+
+    const promise = collect(service.invoke('test', { workingDirectory: '/home/user/clowder-ai' }));
+
+    // No message/assistant event at all — tool-only turn shape. fixture
+    // tail-most gemini-with-tokens is msg-004 (line 8) with tokens.total=130.
+    emitGeminiEvents(proc, [
+      { type: 'init', session_id: 'test-session-uuid-001', model: 'gemini-test' },
+      { type: 'tool_use', tool_name: 'read_file', tool_id: 't1', parameters: { path: '/tmp/x' } },
+      { type: 'tool_result', tool_id: 't1', status: 'success', output: 'file content' },
+      { type: 'result', status: 'success', stats: { total_tokens: 9999, input_tokens: 8888 } },
+    ]);
+
+    const msgs = await promise;
+    const done = msgs.find((m) => m.type === 'done');
+    assert.ok(done?.metadata?.usage, 'done should have usage metadata');
+    assert.equal(done.metadata.usage.inputTokens, 8888);
+    assert.equal(
+      done.metadata.usage.lastTurnInputTokens,
+      130,
+      'tool-only turn (empty assistantText) must still inject lastTurnInputTokens from tail-most jsonl candidate',
+    );
+  } finally {
+    process.env.HOME = previousHome;
+  }
+});
+
 test('matches jsonl content even when Gemini CLI emits multiple text events (\\n\\n chunk boundary)', async () => {
   // Repro of runtime bug observed 2026-05-11: Gemini CLI sometimes emits the
   // same logical turn as multiple `type:"message", role:"assistant"` events,

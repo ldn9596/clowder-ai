@@ -222,13 +222,24 @@ function readGeminiThinkingFromLocalSession(
 
 /**
  * Returns the per-turn `tokens.total` from the LATEST gemini-type message in
- * the local session whose normalized content matches `assistantText`.
+ * the local session.
  *
- * Returns `undefined` when:
- *   - assistantText is empty (tool-only paths — caller decides fallback)
- *   - no matching message found (do NOT degrade to latest unconditionally —
- *     this is the safe path: caller will then disable auto-seal rather than
- *     act on a wrong context-fill estimate)
+ * Resolution strategy:
+ *   - assistantText non-empty: strict normalized-content match (walks
+ *     candidates in reverse, picks LATEST match). When the model emits both
+ *     thinking rows and a final assistant text row, only the final row
+ *     matches, so this remains safe across multiple turns sharing one
+ *     sessionId-bound jsonl.
+ *   - assistantText empty (tool-only turn — model produced no user-visible
+ *     text, only thinking + tool_use): fall back to the tail-most candidate.
+ *     This is safe because sessionId already uniquely scopes the jsonl, and
+ *     the tail-most message is THIS turn's latest (Gemini CLI flushes the
+ *     turn's rows before invokeGeminiCLI yields done). Without this fallback
+ *     tool-only turns get no `lastTurnInputTokens` and fillRatio silently
+ *     degrades back to cumulative inputTokens.
+ *   - non-empty assistantText that matches no jsonl row: undefined. The
+ *     caller (`invoke-single-cat`) treats undefined as "skip auto-seal";
+ *     this is the safe path versus picking a wrong message.
  *
  * Used to populate `metadata.usage.lastTurnInputTokens` so invoke-single-cat's
  * fillRatio uses per-turn context size instead of cumulative session metrics
@@ -240,24 +251,30 @@ function readLatestGeminiContextTokens(
   assistantText: string,
   workingDirectory?: string,
 ): number | undefined {
-  const normalizedAssistantText = normalizeGeminiContent(assistantText);
-  if (normalizedAssistantText.length === 0) return undefined;
-
   const messages = readGeminiSessionMessages(sessionId, workingDirectory);
   if (messages.length === 0) return undefined;
 
   const candidates = messages.filter(
     (message): message is GeminiStoredMessage =>
-      message?.type === 'gemini' && typeof message.content === 'string' && typeof message.tokens?.total === 'number',
+      message?.type === 'gemini' && typeof message.tokens?.total === 'number',
   );
   if (candidates.length === 0) return undefined;
+
+  const normalizedAssistantText = normalizeGeminiContent(assistantText);
+  if (normalizedAssistantText.length === 0) {
+    // Tool-only turn: no user-visible text. Tail-most candidate IS this turn.
+    return candidates[candidates.length - 1].tokens?.total;
+  }
 
   // Walk in reverse to pick the LATEST matching message (handles streamed
   // duplicate rows where Gemini CLI rewrites the same message id with
   // updated tokens).
   const exact = [...candidates]
     .reverse()
-    .find((message) => normalizeGeminiContent(message.content) === normalizedAssistantText);
+    .find(
+      (message) =>
+        typeof message.content === 'string' && normalizeGeminiContent(message.content) === normalizedAssistantText,
+    );
 
   return exact?.tokens?.total;
 }
