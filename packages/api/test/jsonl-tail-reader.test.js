@@ -118,6 +118,35 @@ describe('readJsonlTail', () => {
     assert.equal(result, undefined, 'must give up after maxBytes; should not read entire file to find front match');
   });
 
+  test('preserves multi-byte UTF-8 (CJK) when a line spans multiple chunks', () => {
+    // 3000 CJK chars × 3 bytes ≈ 9 KB → a single line exceeds the 8 KiB
+    // default chunk; at least one chunk boundary lands mid-character.
+    // The previous per-chunk toString('utf8') would inject U+FFFD into the
+    // half-character on each side of the cut, corrupting content and breaking
+    // strict-equality predicates used by readLatestGeminiContextTokens.
+    const longCjk = '汉'.repeat(3000);
+    const target = { type: 'gemini', content: longCjk, tokens: { total: 12345 } };
+    const path = makeJsonlFile([
+      { type: 'user', content: 'first' },
+      target,
+      { type: 'user', content: 'last' }, // tail entry is NOT the target — target sits before EOF.
+    ]);
+
+    const result = readJsonlTail(path, {
+      predicate: (m) =>
+        m != null &&
+        typeof m === 'object' &&
+        m.type === 'gemini' &&
+        m.content === longCjk &&
+        typeof m.tokens?.total === 'number',
+    });
+    assert.equal(
+      result?.tokens?.total,
+      12345,
+      'must find target message via strict content equality even when the line spans multiple chunks',
+    );
+  });
+
   test('handles a large jsonl by reading from tail (sanity, not perf assertion)', () => {
     // ~5000 padded user lines + 1 gemini at the very end. Real perf assertion
     // (e.g. measuring fs.readSync invocations) is left for follow-up; here we

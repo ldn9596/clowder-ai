@@ -62,8 +62,13 @@ export function readJsonlTail<T = unknown>(filePath: string, opts: ReadJsonlTail
     let position = size;
     let bytesRead = 0;
     let linesScanned = 0;
-    /** Partial leading from the previous (newer) chunk's first split element. */
-    let leadingBuffer = '';
+    // Partial leading from the previous (newer) chunk's first segment. Kept
+    // as raw bytes so multi-byte UTF-8 sequences that span a chunk boundary
+    // (CJK content is 3 bytes/char and easily crosses an 8 KiB cut) decode
+    // correctly when the full line is finally assembled. Decoding per-chunk
+    // would insert U+FFFD replacement chars and silently corrupt content,
+    // breaking strict-equality predicates.
+    let leadingBuffer: Buffer = Buffer.alloc(0);
 
     while (position > 0) {
       const chunkSize = Math.min(DEFAULT_CHUNK_SIZE, position);
@@ -73,37 +78,53 @@ export function readJsonlTail<T = unknown>(filePath: string, opts: ReadJsonlTail
       const n = readSync(fd, buffer, 0, chunkSize, position);
       if (n === 0) break;
 
-      // chunkText is older content; leadingBuffer is newer content (already-read
-      // chunk's first element that was a partial line). Concatenated they form
-      // a contiguous slice of the file [position, position+chunkSize+|leadingBuffer|).
-      const combined = buffer.toString('utf8', 0, n) + leadingBuffer;
-      const parts = combined.split('\n');
+      // Older bytes (this chunk) + newer bytes (leadingBuffer from previous
+      // iteration). Together they form a contiguous file slice
+      // [position, position + chunkSize + |leadingBuffer|).
+      const combined = Buffer.concat([buffer.subarray(0, n), leadingBuffer]);
+
+      // Split on newline byte (0x0a). subarray() returns Buffer views sharing
+      // memory with `combined`, so no extra allocation per segment.
+      const parts: Buffer[] = [];
+      let segmentStart = 0;
+      for (let i = 0; i < combined.length; i++) {
+        if (combined[i] === 0x0a) {
+          parts.push(combined.subarray(segmentStart, i));
+          segmentStart = i + 1;
+        }
+      }
+      parts.push(combined.subarray(segmentStart));
 
       // When position > 0 we cannot trust parts[0] is a complete line — it may
       // be the back half of a line whose front half lives in the next (older)
-      // chunk. Save it as leadingBuffer for the next iteration.
+      // chunk. Copy its bytes into leadingBuffer for the next iteration (copy
+      // is required because the next readSync will overwrite `buffer`, and
+      // `combined`/parts views into it).
       // When position === 0 there is no more chunk; parts[0] is the file's
       // first line (complete) and must be processed.
       let processFromIndex: number;
       if (position === 0) {
         processFromIndex = 0;
-        leadingBuffer = '';
+        leadingBuffer = Buffer.alloc(0);
       } else {
         processFromIndex = 1;
-        leadingBuffer = parts[0] ?? '';
+        leadingBuffer = Buffer.from(parts[0] ?? Buffer.alloc(0));
         if (leadingBuffer.length > LEADING_BUFFER_CAP) return undefined;
       }
 
       // Process complete lines in REVERSE (newest first). Skip empty (trailing
       // newline at EOF) and unparseable (partial-write race) lines.
       for (let i = parts.length - 1; i >= processFromIndex; i--) {
-        const line = parts[i];
-        if (line === '') continue;
+        const lineBytes = parts[i];
+        if (lineBytes.length === 0) continue;
         linesScanned++;
         if (linesScanned > maxLines) return undefined;
         let parsed: unknown;
         try {
-          parsed = JSON.parse(line);
+          // Single utf8 decode of a complete line. Multi-byte sequences are
+          // intact because we collected ALL bytes between newlines before
+          // decoding (vs the previous per-chunk decode which split mid-char).
+          parsed = JSON.parse(lineBytes.toString('utf8'));
         } catch {
           continue;
         }
