@@ -70,7 +70,17 @@ interface GeminiStoredSession {
 }
 
 function normalizeGeminiContent(value: string | undefined): string {
-  return (value ?? '').replace(/\s+/g, ' ').trim();
+  // Strip ALL whitespace (not just fold). Gemini CLI can emit one logical turn
+  // as multiple `message/assistant` events; GeminiAgentService stitches them
+  // with `\n\n` into `fullAssistantText`. The jsonl, by contrast, stores the
+  // CLI's final reassembled content with NO extra separator. If the inter-
+  // event boundary lands mid-CJK / mid-digit / mid-path, folding to a single
+  // space leaves the two strings unequal (e.g. "调 用" vs "调用"). Removing
+  // all whitespace is safe because the only consumer (latest-matching-message
+  // lookup within ONE sessionId-bound jsonl) walks candidates in reverse —
+  // collisions across turns are resolved to the latest, which IS the turn we
+  // just yielded.
+  return (value ?? '').replace(/\s+/g, '');
 }
 
 function formatGeminiThoughts(thoughts: readonly GeminiStoredThought[]): string {

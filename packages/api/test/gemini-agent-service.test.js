@@ -1018,6 +1018,55 @@ test('does not fall back to latest message when assistant text matches no jsonl 
   }
 });
 
+test('matches jsonl content even when Gemini CLI emits multiple text events (\\n\\n chunk boundary)', async () => {
+  // Repro of runtime bug observed 2026-05-11: Gemini CLI sometimes emits the
+  // same logical turn as multiple `type:"message", role:"assistant"` events,
+  // which GeminiAgentService concatenates with `\n\n` separators into
+  // `fullAssistantText`. Local jsonl, however, stores the CLI's final
+  // re-assembled content as a single string with NO `\n\n`. With the prior
+  // normalize (`\s+` → ' '), these would diverge for any inter-event boundary
+  // that fell mid-CJK / mid-digit / mid-path: "调\n\n用" → "调 用" != "调用".
+  // Fix: normalize strips all whitespace, not just folds it.
+  const proc = createMockProcess();
+  const spawnFn = createMockSpawnFn(proc);
+  const service = new GeminiAgentService({ spawnFn, adapter: 'gemini-cli' });
+
+  const fakeHome = mkdtempSync(join(tmpdir(), 'gemini-home-'));
+  const sessionDir = join(fakeHome, '.gemini', 'tmp', 'clowder-ai', 'chats');
+  mkdirSync(sessionDir, { recursive: true });
+  const previousHome = process.env.HOME;
+  process.env.HOME = fakeHome;
+
+  try {
+    const fixturePath = join(import.meta.dirname, 'fixtures', 'gemini-session-chunk-boundary.jsonl');
+    const jsonlContent = readFileSync(fixturePath, 'utf8');
+    writeFileSync(join(sessionDir, 'session-2026-05-09T01-00-chunk001.jsonl'), jsonlContent);
+
+    const promise = collect(service.invoke('test', { workingDirectory: '/home/user/clowder-ai' }));
+
+    // Two assistant events; together they assemble into "调用工具完成了" in the
+    // jsonl, but GeminiAgentService stitches them as "调\n\n用工具完成了".
+    emitGeminiEvents(proc, [
+      { type: 'init', session_id: 'test-session-chunk-001', model: 'gemini-test' },
+      { type: 'message', role: 'assistant', content: '调', delta: true },
+      { type: 'message', role: 'assistant', content: '用工具完成了', delta: true },
+      { type: 'result', status: 'success', stats: { total_tokens: 9999, input_tokens: 8888 } },
+    ]);
+
+    const msgs = await promise;
+    const done = msgs.find((m) => m.type === 'done');
+    assert.ok(done?.metadata?.usage, 'done should have usage metadata');
+    assert.equal(done.metadata.usage.inputTokens, 8888);
+    assert.equal(
+      done.metadata.usage.lastTurnInputTokens,
+      77,
+      'lastTurnInputTokens must match the jsonl message even when fullAssistantText has \\n\\n boundaries inserted between events',
+    );
+  } finally {
+    process.env.HOME = previousHome;
+  }
+});
+
 test('reads .jsonl files (Gemini CLI real format) and extracts thinking from matching message', async () => {
   // Latent bug regression: existing readGeminiThinkingFromLocalSession previously
   // filtered for .json only, but real Gemini CLI writes .jsonl. This test ensures
