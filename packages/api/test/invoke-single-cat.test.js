@@ -934,6 +934,7 @@ describe('invokeSingleCat audit events (P1 fix)', () => {
     assert.equal(payload.health.usedTokens, 50000);
     assert.equal(payload.health.windowTokens, 200000);
     assert.equal(payload.health.source, 'exact');
+    assert.equal(payload.health.usedFrom, 'input');
     assert.ok(payload.health.fillRatio > 0 && payload.health.fillRatio <= 1);
   });
 
@@ -1075,6 +1076,7 @@ describe('invokeSingleCat audit events (P1 fix)', () => {
     assert.equal(active.contextHealth.windowTokens, 200000);
     assert.equal(active.contextHealth.fillRatio, 0.7);
     assert.equal(active.contextHealth.source, 'exact');
+    assert.equal(active.contextHealth.usedFrom, 'input');
   });
 
   it('F24-fix: prefers lastTurnInputTokens over aggregated inputTokens for context health', async () => {
@@ -1131,6 +1133,7 @@ describe('invokeSingleCat audit events (P1 fix)', () => {
       44000,
       'context health should use lastTurnInputTokens, not aggregated inputTokens',
     );
+    assert.equal(payload.health.usedFrom, 'last_turn');
     assert.equal(payload.health.windowTokens, 200000);
     // fillRatio should be 44000/200000 = 0.22, not 192000/200000 = 0.96
     const expectedRatio = 44000 / 200000;
@@ -1189,6 +1192,7 @@ describe('invokeSingleCat audit events (P1 fix)', () => {
       50000,
       'should fall back to inputTokens when lastTurnInputTokens is absent',
     );
+    assert.equal(payload.health.usedFrom, 'input');
   });
 
   it('F24: falls back to totalTokens when inputTokens are unavailable (totalTokens-only provider)', async () => {
@@ -1238,6 +1242,7 @@ describe('invokeSingleCat audit events (P1 fix)', () => {
     assert.equal(payload.catId, 'codex');
     assert.equal(payload.health.usedTokens, 4200);
     assert.equal(payload.health.source, 'approx');
+    assert.equal(payload.health.usedFrom, 'total');
   });
 
   it('F24: marks source as approx when usedTokens falls back to totalTokens despite exact window', async () => {
@@ -5270,6 +5275,11 @@ describe('invokeSingleCat audit events (P1 fix)', () => {
       healthPayload.health.fillRatio,
       0.9,
       'fillRatio computed from cumulative usage (telemetry visible) but auto-seal is gated below',
+    );
+    assert.equal(
+      healthPayload.health.usedFrom,
+      'input',
+      'context_health should expose that this Gemini health value came from cumulative inputTokens fallback',
     );
 
     // session_seal_requested MUST NOT emit; requestSeal MUST NOT be called
