@@ -386,7 +386,7 @@ describe('GeminiAgentService (gemini-cli adapter)', () => {
     assert.equal(msgs[msgs.length - 1].type, 'done');
   });
 
-  test('separates multi-turn assistant text with paragraph breaks (turn newline fix)', async () => {
+  test('raw-concats consecutive assistant streaming deltas without synthetic separators', async () => {
     const proc = createMockProcess();
     const spawnFn = createMockSpawnFn(proc);
     const service = new GeminiAgentService({ spawnFn, adapter: 'gemini-cli' });
@@ -1119,8 +1119,8 @@ test('matches jsonl final row when fullAssistantText is thinking-prefix + final 
   // Repro of runtime bug observed 2026-05-11 (LD visual verification rounds 4 & 6):
   // when the model thinks first then produces a final reply, Gemini CLI emits
   // MULTIPLE `message/assistant` events (one per thinking step + one final).
-  // GeminiAgentService stitches them with `\n\n` into fullAssistantText, e.g.:
-  //   "**Counting lines in source files**...\n\n**Calculating Line Counts**...\n\n实际 final text"
+  // GeminiAgentService raw-concats them into fullAssistantText, e.g.:
+  //   "**Counting lines in source files****Calculating Line Counts**实际 final text"
   // The jsonl, however, stores each step in its own row — the FINAL row's
   // content equals only "实际 final text" (the tail). Strict equality would
   // miss this; the suffix-match branch of matchesCurrentAssistantText must
@@ -1191,7 +1191,7 @@ test('matches jsonl final row when fullAssistantText is thinking-prefix + final 
     assert.equal(
       done.metadata.usage.lastTurnInputTokens,
       42,
-      'thinking-prefix shape (stitched assistantText, separate jsonl rows) MUST still resolve via suffix-match — final row tokens.input (=42), NOT cumulative (=8888), NOT thinking-row tokens (=10 / =20)',
+      'thinking-prefix shape (accumulated assistantText, separate jsonl rows) MUST still resolve via suffix-match — final row tokens.input (=42), NOT cumulative (=8888), NOT thinking-row tokens (=10 / =20)',
     );
   } finally {
     process.env.HOME = previousHome;
