@@ -6,7 +6,7 @@
 import './helpers/setup-cat-registry.js';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -6760,8 +6760,44 @@ describe('invokeSingleCat audit events (P1 fix)', () => {
     assert.equal(optionsSeen[0]?.workingDirectory, undefined, 'workingDirectory must be undefined for game threads');
   });
 
+  it('fails loud for OpenCode when thread projectPath is a virtual game path', async () => {
+    let invokedService = false;
+    const service = {
+      l0CompilerFn: dummyL0CompilerFn,
+      async *invoke() {
+        invokedService = true;
+        yield { type: 'done', catId: 'opencode', timestamp: Date.now() };
+      },
+    };
+
+    const deps = {
+      ...makeDeps(),
+      threadStore: {
+        get: async () => ({ projectPath: 'games/werewolf', createdBy: 'user1' }),
+        updateParticipantActivity: async () => {},
+      },
+    };
+
+    const msgs = await collect(
+      invokeSingleCat(deps, {
+        catId: 'opencode',
+        service,
+        prompt: 'test game briefing',
+        userId: 'user1',
+        threadId: 'thread-opencode-game-werewolf',
+        isLastCat: true,
+      }),
+    );
+
+    assert.equal(invokedService, false, 'OpenCode must not inherit runtime cwd for virtual game projectPaths');
+    assert.ok(
+      msgs.some((m) => m.type === 'error' && String(m.error).includes('virtual game projectPath games/werewolf')),
+      `expected virtual game projectPath error, got: ${msgs.map((m) => m.type).join(',')}`,
+    );
+  });
+
   it('passes a valid thread projectPath as OpenCode workingDirectory', async () => {
-    const projectRoot = process.cwd();
+    const projectRoot = await realpath(join(__dirname, '..', '..', '..'));
 
     const optionsSeen = [];
     const service = {
@@ -6952,6 +6988,44 @@ describe('invokeSingleCat audit events (P1 fix)', () => {
     assert.ok(
       !msgs.some((m) => m.type === 'error' && String(m.error).includes('Unable to resolve thread workspace')),
       'threadStore transient failure must not hard-fail invocation',
+    );
+  });
+
+  it('fails loud for OpenCode when thread workspace lookup fails before spawn', async () => {
+    let invokedService = false;
+    const service = {
+      l0CompilerFn: dummyL0CompilerFn,
+      async *invoke() {
+        invokedService = true;
+        yield { type: 'done', catId: 'opencode', timestamp: Date.now() };
+      },
+    };
+
+    const deps = {
+      ...makeDeps(),
+      threadStore: {
+        get: async () => {
+          throw new Error('thread store unavailable');
+        },
+        updateParticipantActivity: async () => {},
+      },
+    };
+
+    const msgs = await collect(
+      invokeSingleCat(deps, {
+        catId: 'opencode',
+        service,
+        prompt: 'test opencode workspace lookup failure',
+        userId: 'user1',
+        threadId: 'thread-opencode-workspace-lookup-fails',
+        isLastCat: true,
+      }),
+    );
+
+    assert.equal(invokedService, false, 'OpenCode must not inherit runtime cwd when workspace lookup fails');
+    assert.ok(
+      msgs.some((m) => m.type === 'error' && String(m.error).includes('Unable to resolve thread workspace')),
+      `expected OpenCode workspace lookup error, got: ${msgs.map((m) => m.type).join(',')}`,
     );
   });
 

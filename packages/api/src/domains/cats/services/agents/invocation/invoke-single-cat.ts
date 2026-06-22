@@ -71,7 +71,7 @@ import { resolveActiveProjectRoot } from '../../../../../utils/active-project-ro
 import { resolveCliCommand } from '../../../../../utils/cli-resolve.js';
 import { DEFAULT_CLI_TIMEOUT_MS, resolveCliTimeoutMs } from '../../../../../utils/cli-timeout.js';
 import { findMonorepoRoot, isSameProject } from '../../../../../utils/monorepo-root.js';
-import { validateProjectPath } from '../../../../../utils/project-path.js';
+import { validateProjectPathDetailed } from '../../../../../utils/project-path.js';
 import { tcpProbe } from '../../../../../utils/tcp-probe.js';
 import type { AgentPaneRegistry } from '../../../../terminal/agent-pane-registry.js';
 import type { TmuxGateway } from '../../../../terminal/tmux-gateway.js';
@@ -978,11 +978,13 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
     let workingDirectory: string | undefined;
     let bootcampWorkspaceError: Error | undefined;
     let workspaceResolutionError: Error | undefined;
+    let workspaceResolutionFailureMessage: string | undefined;
     if (threadStore) {
       let thread: Awaited<ReturnType<IThreadStore['get']>> | null | undefined;
       try {
         thread = await preflightRace(Promise.resolve(threadStore.get(threadId)), 'threadStore.get', signal);
       } catch (err) {
+        workspaceResolutionFailureMessage = `Unable to resolve thread workspace for ${threadId}: ${err instanceof Error ? err.message : String(err)}`;
         log.warn(
           { catId, threadId, err },
           'threadStore.get failed during workspace resolution — proceeding without workingDirectory',
@@ -1019,20 +1021,27 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
           // F101: Game threads use virtual projectPaths (e.g. 'games/werewolf') for
           // categorization only — they are not real filesystem directories. Skip them
           // to avoid triggering the F070 governance gate on a non-existent path.
-          if (!thread.projectPath.startsWith('games/')) {
-            const validatedProjectPath = await validateProjectPath(thread.projectPath);
-            if (!validatedProjectPath) {
+          if (thread.projectPath.startsWith('games/')) {
+            workspaceResolutionFailureMessage = `OpenCode requires a filesystem thread projectPath for ${threadId}; virtual game projectPath ${thread.projectPath} cannot be used as a working directory.`;
+          } else {
+            const validatedProjectPath = await validateProjectPathDetailed(thread.projectPath);
+            if (!validatedProjectPath.ok) {
+              const isTransient = validatedProjectPath.reason === 'io_error';
+              workspaceResolutionFailureMessage = isTransient
+                ? `Unable to validate thread projectPath for ${threadId}: ${thread.projectPath}. ${validatedProjectPath.message ?? 'Transient filesystem error.'}`
+                : `Invalid thread projectPath for ${threadId}: ${thread.projectPath}. Expected an existing directory under allowed roots.`;
               log.warn(
-                { catId, threadId, projectPath: thread.projectPath },
+                {
+                  catId,
+                  threadId,
+                  projectPath: thread.projectPath,
+                  reason: validatedProjectPath.reason,
+                  message: validatedProjectPath.message,
+                },
                 'thread projectPath failed validation during workspace resolution',
               );
-              if (requiresThreadWorkspace) {
-                workspaceResolutionError = new Error(
-                  `Invalid thread projectPath for ${threadId}: ${thread.projectPath}. Expected an existing directory under allowed roots.`,
-                );
-              }
             } else {
-              workingDirectory = validatedProjectPath;
+              workingDirectory = validatedProjectPath.path;
             }
           }
         } else if (thread?.bootcampState) {
@@ -1043,11 +1052,15 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
             bootcampWorkspaceError = new Error(bootcampWorkspace.error);
           }
         } else if (requiresThreadWorkspace) {
-          workspaceResolutionError = new Error(
-            `OpenCode requires a thread projectPath for ${threadId}. Bind the thread to a project workspace before spawning OpenCode.`,
-          );
+          workspaceResolutionFailureMessage = `OpenCode requires a thread projectPath for ${threadId}. Bind the thread to a project workspace before spawning OpenCode.`;
         }
       }
+    }
+    if (requiresThreadWorkspace && threadStore && !workingDirectory && !bootcampWorkspaceError) {
+      workspaceResolutionError = new Error(
+        workspaceResolutionFailureMessage ??
+          `OpenCode requires a thread projectPath for ${threadId}. Bind the thread to a project workspace before spawning OpenCode.`,
+      );
     }
     if (bootcampWorkspaceError) {
       throw bootcampWorkspaceError;
