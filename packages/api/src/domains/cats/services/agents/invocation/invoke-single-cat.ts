@@ -23,6 +23,7 @@ import {
 } from '@cat-cafe/shared';
 import { context, SpanStatusCode, trace } from '@opentelemetry/api';
 import {
+  providerRequiresThreadWorkspace,
   resolveBuiltinClientForProvider,
   resolveForClient,
   validateRuntimeProviderBinding,
@@ -972,7 +973,7 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
 
     const catConfig = catRegistry.tryGet(catId as string)?.config;
     const provider = catConfig?.clientId;
-    const requiresThreadWorkspace = provider === 'opencode';
+    const requiresThreadWorkspace = providerRequiresThreadWorkspace(provider);
 
     // Resolve workingDirectory from thread's projectPath
     let workingDirectory: string | undefined;
@@ -1028,7 +1029,7 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
             if (!validatedProjectPath.ok) {
               const isTransient = validatedProjectPath.reason === 'io_error';
               workspaceResolutionFailureMessage = isTransient
-                ? `Unable to validate thread projectPath for ${threadId}: ${thread.projectPath}. ${validatedProjectPath.message ?? 'Transient filesystem error.'}`
+                ? `Unable to validate thread projectPath for ${threadId}: ${thread.projectPath}. ${validatedProjectPath.message ?? 'Transient filesystem error.'} Retry; if it persists, re-bind the thread's project workspace.`
                 : `Invalid thread projectPath for ${threadId}: ${thread.projectPath}. Expected an existing directory under allowed roots.`;
               log.warn(
                 {
