@@ -425,6 +425,18 @@ describe('OpenCodeAgentService', () => {
     assert.strictEqual(opts.cwd, '/tmp/project');
   });
 
+  test('derives child workspace env from workingDirectory', async () => {
+    const proc = createMockProcess();
+    const spawnFn = mock.fn(() => proc);
+    const service = new OpenCodeAgentService({ catId: 'opencode', spawnFn, model: 'claude-haiku-4-5' });
+    const promise = collect(service.invoke('Test', { workingDirectory: '/tmp/project' }));
+    emitOpenCodeEvents(proc, [STEP_START, TEXT_RESPONSE, STEP_FINISH]);
+    await promise;
+
+    const opts = spawnFn.mock.calls[0].arguments[2];
+    assert.strictEqual(opts.env.ALLOWED_WORKSPACE_DIRS, '/tmp/project');
+  });
+
   test('yields error + done on CLI exit failure', async () => {
     const proc = createMockProcess(1);
     const spawnFn = mock.fn(() => proc);

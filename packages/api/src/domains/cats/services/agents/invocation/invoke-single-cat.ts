@@ -71,7 +71,7 @@ import { resolveActiveProjectRoot } from '../../../../../utils/active-project-ro
 import { resolveCliCommand } from '../../../../../utils/cli-resolve.js';
 import { DEFAULT_CLI_TIMEOUT_MS, resolveCliTimeoutMs } from '../../../../../utils/cli-timeout.js';
 import { findMonorepoRoot, isSameProject } from '../../../../../utils/monorepo-root.js';
-import { isUnderAllowedRoot } from '../../../../../utils/project-path.js';
+import { validateProjectPath } from '../../../../../utils/project-path.js';
 import { tcpProbe } from '../../../../../utils/tcp-probe.js';
 import type { AgentPaneRegistry } from '../../../../terminal/agent-pane-registry.js';
 import type { TmuxGateway } from '../../../../terminal/tmux-gateway.js';
@@ -970,13 +970,26 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
       }
     }
 
+    const catConfig = catRegistry.tryGet(catId as string)?.config;
+    const provider = catConfig?.clientId;
+    const requiresThreadWorkspace = provider === 'opencode';
+
     // Resolve workingDirectory from thread's projectPath
     let workingDirectory: string | undefined;
     let bootcampWorkspaceError: Error | undefined;
+    let workspaceResolutionError: Error | undefined;
     if (threadStore) {
+      let thread: Awaited<ReturnType<IThreadStore['get']>> | null | undefined;
       try {
-        const thread = await preflightRace(Promise.resolve(threadStore.get(threadId)), 'threadStore.get', signal);
-        if (thread?.createdAt) threadCreatedAt = thread.createdAt;
+        thread = await preflightRace(Promise.resolve(threadStore.get(threadId)), 'threadStore.get', signal);
+      } catch (err) {
+        log.warn(
+          { catId, threadId, err },
+          'threadStore.get failed during workspace resolution — proceeding without workingDirectory',
+        );
+      }
+      if (thread) {
+        if (thread.createdAt) threadCreatedAt = thread.createdAt;
         // #836: Reborn session strategy — force new session every invocation.
         // Uses store lookup (isRebornSession) instead of thread field because
         // Redis stores strategy in separate hash fields not hydrated by get().
@@ -1006,8 +1019,21 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
           // F101: Game threads use virtual projectPaths (e.g. 'games/werewolf') for
           // categorization only — they are not real filesystem directories. Skip them
           // to avoid triggering the F070 governance gate on a non-existent path.
-          if (!thread.projectPath.startsWith('games/') && isUnderAllowedRoot(thread.projectPath)) {
-            workingDirectory = thread.projectPath;
+          if (!thread.projectPath.startsWith('games/')) {
+            const validatedProjectPath = await validateProjectPath(thread.projectPath);
+            if (!validatedProjectPath) {
+              log.warn(
+                { catId, threadId, projectPath: thread.projectPath },
+                'thread projectPath failed validation during workspace resolution',
+              );
+              if (requiresThreadWorkspace) {
+                workspaceResolutionError = new Error(
+                  `Invalid thread projectPath for ${threadId}: ${thread.projectPath}. Expected an existing directory under allowed roots.`,
+                );
+              }
+            } else {
+              workingDirectory = validatedProjectPath;
+            }
           }
         } else if (thread?.bootcampState) {
           const bootcampWorkspace = await resolveBootcampWorkspaceRoot();
@@ -1016,13 +1042,18 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
           } else {
             bootcampWorkspaceError = new Error(bootcampWorkspace.error);
           }
+        } else if (requiresThreadWorkspace) {
+          workspaceResolutionError = new Error(
+            `OpenCode requires a thread projectPath for ${threadId}. Bind the thread to a project workspace before spawning OpenCode.`,
+          );
         }
-      } catch {
-        // Thread store timeout or error — proceed without workingDirectory
       }
     }
     if (bootcampWorkspaceError) {
       throw bootcampWorkspaceError;
+    }
+    if (workspaceResolutionError) {
+      throw workspaceResolutionError;
     }
     const workingProjectRoot = workingDirectory ? findMonorepoRoot(workingDirectory) : undefined;
 
@@ -1150,8 +1181,6 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
 
     // F127 account injection:
     // Members bind to a concrete accountRef (builtin oauth account or generic api_key account).
-    const catConfig = catRegistry.tryGet(catId as string)?.config;
-    const provider = catConfig?.clientId;
     const builtinClient = provider ? resolveBuiltinClientForProvider(provider) : null;
     const defaultModel = catConfig?.defaultModel?.trim() || undefined;
     // Account resolution, proxy registration, and runtime config always use the
@@ -1468,6 +1497,7 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
     }
 
     const openCodeExternalDirs: string[] = [];
+    const openCodeAllowedWorkspaceDirs = workingDirectory ? resolve(workingDirectory) : undefined;
     if (provider === 'opencode') {
       if (workingDirectory && !isSameProject(workingDirectory, hostProjectRoot)) {
         // External project — grant access to Clowder AI host root (configs, MCP, etc.)
@@ -1508,6 +1538,7 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
         hasBaseUrl: Boolean(resolvedAccount.baseUrl),
         omitProviderAuth: !isApiKey,
         mcpServerPath,
+        ...(openCodeAllowedWorkspaceDirs ? { allowedWorkspaceDirs: openCodeAllowedWorkspaceDirs } : {}),
         // F203 Phase I: inject compiled L0 + OPENCODE.md into instructions.
         instructions: openCodeL0InstructionPaths,
         // #935: External directory permissions for Windows/cross-project access.

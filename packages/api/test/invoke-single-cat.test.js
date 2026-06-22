@@ -6760,6 +6760,201 @@ describe('invokeSingleCat audit events (P1 fix)', () => {
     assert.equal(optionsSeen[0]?.workingDirectory, undefined, 'workingDirectory must be undefined for game threads');
   });
 
+  it('passes a valid thread projectPath as OpenCode workingDirectory', async () => {
+    const projectRoot = process.cwd();
+
+    const optionsSeen = [];
+    const service = {
+      l0CompilerFn: dummyL0CompilerFn,
+      async *invoke(_prompt, options) {
+        optionsSeen.push(options ?? {});
+        yield { type: 'done', catId: 'opencode', timestamp: Date.now() };
+      },
+    };
+
+    const deps = {
+      ...makeDeps(),
+      threadStore: {
+        get: async () => ({ projectPath: projectRoot, createdBy: 'user1' }),
+        updateParticipantActivity: async () => {},
+      },
+    };
+
+    const msgs = await collect(
+      invokeSingleCat(deps, {
+        catId: 'opencode',
+        service,
+        prompt: 'test project cwd',
+        userId: 'user1',
+        threadId: 'thread-opencode-project-cwd',
+        isLastCat: true,
+      }),
+    );
+
+    assert.ok(
+      msgs.some((m) => m.type === 'done'),
+      'service should complete',
+    );
+    assert.equal(optionsSeen.length, 1, `service should be invoked once, got messages: ${JSON.stringify(msgs)}`);
+    assert.equal(optionsSeen[0]?.workingDirectory, projectRoot);
+  });
+
+  it('fails loud for OpenCode when thread projectPath is default', async () => {
+    let invokedService = false;
+    const service = {
+      l0CompilerFn: dummyL0CompilerFn,
+      async *invoke() {
+        invokedService = true;
+        yield { type: 'done', catId: 'opencode', timestamp: Date.now() };
+      },
+    };
+
+    const deps = {
+      ...makeDeps(),
+      threadStore: {
+        get: async () => ({ projectPath: 'default', createdBy: 'user1' }),
+        updateParticipantActivity: async () => {},
+      },
+    };
+
+    const msgs = await collect(
+      invokeSingleCat(deps, {
+        catId: 'opencode',
+        service,
+        prompt: 'test missing project path',
+        userId: 'user1',
+        threadId: 'thread-default-project-path',
+        isLastCat: true,
+      }),
+    );
+
+    assert.equal(invokedService, false, 'OpenCode must not inherit runtime cwd when projectPath is default');
+    assert.ok(
+      msgs.some((m) => m.type === 'error' && String(m.error).includes('OpenCode requires a thread projectPath')),
+      `expected missing projectPath error, got: ${msgs.map((m) => m.type).join(',')}`,
+    );
+  });
+
+  it('fails loud for OpenCode when thread projectPath is rejected by project-path validation', async () => {
+    let invokedService = false;
+    const service = {
+      l0CompilerFn: dummyL0CompilerFn,
+      async *invoke() {
+        invokedService = true;
+        yield { type: 'done', catId: 'opencode', timestamp: Date.now() };
+      },
+    };
+
+    const deps = {
+      ...makeDeps(),
+      threadStore: {
+        get: async () => ({ projectPath: '/dev', createdBy: 'user1' }),
+        updateParticipantActivity: async () => {},
+      },
+    };
+
+    const msgs = await collect(
+      invokeSingleCat(deps, {
+        catId: 'opencode',
+        service,
+        prompt: 'test invalid project path',
+        userId: 'user1',
+        threadId: 'thread-invalid-project-path',
+        isLastCat: true,
+      }),
+    );
+
+    assert.equal(invokedService, false, 'OpenCode must not spawn when projectPath is invalid');
+    assert.ok(
+      msgs.some((m) => m.type === 'error' && String(m.error).includes('Invalid thread projectPath')),
+      `expected invalid projectPath error, got: ${msgs.map((m) => m.type).join(',')}`,
+    );
+  });
+
+  it('degrades for non-OpenCode when thread projectPath is rejected by project-path validation', async () => {
+    let invokedService = false;
+    const service = {
+      l0CompilerFn: dummyL0CompilerFn,
+      async *invoke(_prompt, options) {
+        invokedService = true;
+        assert.equal(options?.workingDirectory, undefined);
+        yield { type: 'done', catId: 'opus', timestamp: Date.now() };
+      },
+    };
+
+    const deps = {
+      ...makeDeps(),
+      threadStore: {
+        get: async () => ({ projectPath: '/dev', createdBy: 'user1' }),
+        updateParticipantActivity: async () => {},
+      },
+    };
+
+    const msgs = await collect(
+      invokeSingleCat(deps, {
+        catId: 'opus',
+        service,
+        prompt: 'test invalid project path degrade',
+        userId: 'user1',
+        threadId: 'thread-invalid-project-path-non-opencode',
+        isLastCat: true,
+      }),
+    );
+
+    assert.equal(invokedService, true, 'non-OpenCode providers keep best-effort fallback');
+    assert.ok(
+      msgs.some((m) => m.type === 'done'),
+      'should reach done',
+    );
+    assert.ok(
+      !msgs.some((m) => m.type === 'error' && String(m.error).includes('Invalid thread projectPath')),
+      'non-OpenCode provider must not hard-fail historical invalid projectPath',
+    );
+  });
+
+  it('degrades when thread workspace lookup fails before spawn', async () => {
+    let invokedService = false;
+    const service = {
+      l0CompilerFn: dummyL0CompilerFn,
+      async *invoke(_prompt, options) {
+        invokedService = true;
+        assert.equal(options?.workingDirectory, undefined);
+        yield { type: 'done', catId: 'opus', timestamp: Date.now() };
+      },
+    };
+
+    const deps = {
+      ...makeDeps(),
+      threadStore: {
+        get: async () => {
+          throw new Error('thread store unavailable');
+        },
+        updateParticipantActivity: async () => {},
+      },
+    };
+
+    const msgs = await collect(
+      invokeSingleCat(deps, {
+        catId: 'opus',
+        service,
+        prompt: 'test workspace lookup failure degrade',
+        userId: 'user1',
+        threadId: 'thread-workspace-lookup-fails',
+        isLastCat: true,
+      }),
+    );
+
+    assert.equal(invokedService, true, 'threadStore transient failure should keep best-effort fallback');
+    assert.ok(
+      msgs.some((m) => m.type === 'done'),
+      'should reach done',
+    );
+    assert.ok(
+      !msgs.some((m) => m.type === 'error' && String(m.error).includes('Unable to resolve thread workspace')),
+      'threadStore transient failure must not hard-fail invocation',
+    );
+  });
+
   it('bug-fix: account resolution uses runtime root (process.cwd()), not thread.projectPath', async () => {
     // Regression: thread.projectPath points to dev worktree which lacks runtime-only accounts.
     // Account resolution must always use process.cwd() (the runtime root).

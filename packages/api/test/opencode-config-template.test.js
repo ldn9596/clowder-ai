@@ -432,6 +432,25 @@ describe('generateOpenCodeRuntimeConfig', () => {
     });
   });
 
+  test('mcp.cat-cafe environment uses the invocation workspace', () => {
+    const config = generateOpenCodeRuntimeConfig({
+      providerName: 'anthropic',
+      models: ['anthropic/claude-opus-4-6'],
+      defaultModel: 'anthropic/claude-opus-4-6',
+      apiType: 'anthropic',
+      mcpServerPath: '/absolute/path/to/packages/mcp-server/dist/index.js',
+      allowedWorkspaceDirs: '/tmp/project',
+    });
+
+    assert.deepStrictEqual(config.mcp['cat-cafe'], {
+      type: 'local',
+      command: ['node', '/absolute/path/to/packages/mcp-server/dist/index.js'],
+      environment: {
+        ALLOWED_WORKSPACE_DIRS: '/tmp/project',
+      },
+    });
+  });
+
   test('#871: non-api_key runtime config can omit provider auth placeholders', () => {
     const config = generateOpenCodeRuntimeConfig({
       providerName: 'anthropic',

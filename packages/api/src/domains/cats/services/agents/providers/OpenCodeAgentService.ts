@@ -14,6 +14,7 @@
  *   error       → error
  */
 
+import { resolve } from 'node:path';
 import { type CatId, createCatId } from '@cat-cafe/shared';
 import { getCatModel } from '../../../../../config/cat-models.js';
 import { createModuleLogger } from '../../../../../infrastructure/logger.js';
@@ -99,6 +100,11 @@ export function summarizeOpenCodeEnvForDebug(env: Record<string, string | null> 
 /** F203 Phase I: env var signaling that OPENCODE_CONFIG is instructions-only (no custom provider). */
 export const OC_INSTRUCTIONS_ONLY_ENV = 'CAT_CAFE_OC_INSTRUCTIONS_ONLY';
 
+function resolveAllowedWorkspaceDirs(workingDirectory?: string): string | undefined {
+  const threadWorkspace = workingDirectory?.trim();
+  return threadWorkspace ? resolve(threadWorkspace) : undefined;
+}
+
 export class OpenCodeAgentService implements L0InjectableAgentService {
   readonly catId: CatId;
   private readonly model: string;
@@ -139,7 +145,7 @@ export class OpenCodeAgentService implements L0InjectableAgentService {
     const effectiveModel = options?.callbackEnv?.CAT_CAFE_ANTHROPIC_MODEL_OVERRIDE ?? this.model;
     const args = this.buildArgs(prompt, options?.sessionId, effectiveModel, options?.cliConfigArgs);
     const cwd = options?.workingDirectory;
-    const childEnv = this.buildEnv(options?.callbackEnv);
+    const childEnv = this.buildEnv(options?.callbackEnv, cwd);
     // F171: Account env vars applied LAST — user overrides provider-injected values
     if (options?.accountEnv) {
       for (const [k, v] of Object.entries(options.accountEnv)) childEnv[k] = v;
@@ -432,8 +438,10 @@ export class OpenCodeAgentService implements L0InjectableAgentService {
     return deduped;
   }
 
-  private buildEnv(callbackEnv?: Record<string, string>): Record<string, string | null> {
+  private buildEnv(callbackEnv?: Record<string, string>, workingDirectory?: string): Record<string, string | null> {
     const env: Record<string, string | null> = { ...callbackEnv };
+    const allowedWorkspaceDirs = resolveAllowedWorkspaceDirs(workingDirectory);
+    if (allowedWorkspaceDirs) env.ALLOWED_WORKSPACE_DIRS = allowedWorkspaceDirs;
 
     // clowder-ai#223: When OPENCODE_CONFIG is set (custom provider via runtime config file),
     // credentials are injected via {env:CAT_CAFE_OC_*} substitution in the config.
