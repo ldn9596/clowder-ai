@@ -127,7 +127,7 @@ describe('capabilities MCP write routes', () => {
     assert.deepEqual(config?.capabilities, []);
   });
 
-  it('rejects local-looking MCP writes when the API is bound for LAN access', async () => {
+  it('allows loopback MCP writes when the API is bound for LAN access', async () => {
     setEnv('API_SERVER_HOST', '0.0.0.0');
 
     const res = await app.inject({
@@ -136,14 +136,14 @@ describe('capabilities MCP write routes', () => {
       headers: LOCAL_OWNER_HEADERS,
       payload: {
         id: 'external-mcp',
-        resolver: 'chrome-extension',
+        command: 'node',
+        args: ['server.js'],
       },
     });
 
-    assert.equal(res.statusCode, 403);
-    assert.match(JSON.parse(res.payload).error, /direct localhost/i);
+    assert.equal(res.statusCode, 200, res.payload);
     const config = await readCapabilitiesConfig(projectRoot);
-    assert.deepEqual(config?.capabilities, []);
+    assert.equal(config?.capabilities.some((entry) => entry.id === 'external-mcp'), true);
   });
 
   it('rejects header-only identity for every MCP write route', async () => {
