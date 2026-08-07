@@ -290,6 +290,44 @@ export function isPreconfiguredConnectorAutostartEnabled(env: ConnectorAutostart
   return parseBooleanOverride(env.CONNECTOR_GATEWAY_AUTOSTART) === true;
 }
 
+export type PreconfiguredConnectorAutostartStatus =
+  | 'enabled'
+  | 'disabled-no-credentials'
+  | 'disabled-credentials-suppressed';
+
+const PRECONFIGURED_CONNECTOR_CREDENTIAL_FIELDS = [
+  'telegramBotToken',
+  'feishuAppId',
+  'feishuAppSecret',
+  'feishuVerificationToken',
+  'dingtalkAppKey',
+  'dingtalkAppSecret',
+  'weixinBotToken',
+  'wecomBotId',
+  'wecomBotSecret',
+  'wecomCorpId',
+  'wecomAgentId',
+  'wecomAgentSecret',
+  'wecomToken',
+  'wecomEncodingAesKey',
+  'xiaoyiAk',
+  'xiaoyiSk',
+  'xiaoyiAgentId',
+] as const satisfies readonly (keyof ConnectorGatewayConfig)[];
+
+export function classifyPreconfiguredConnectorAutostart(
+  config: ConnectorGatewayConfig,
+  env: ConnectorAutostartEnv = process.env,
+): PreconfiguredConnectorAutostartStatus {
+  if (isPreconfiguredConnectorAutostartEnabled(env)) return 'enabled';
+
+  const hasCredentials = PRECONFIGURED_CONNECTOR_CREDENTIAL_FIELDS.some((field) => {
+    const value = config[field];
+    return typeof value === 'string' && value.trim().length > 0;
+  });
+  return hasCredentials ? 'disabled-credentials-suppressed' : 'disabled-no-credentials';
+}
+
 export function applyConnectorGatewayAutostartPolicy(
   config: ConnectorGatewayConfig,
   env: ConnectorAutostartEnv = process.env,

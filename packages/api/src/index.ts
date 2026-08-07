@@ -191,7 +191,7 @@ import { parseManifestSlashCommands } from './infrastructure/commands/manifest-c
 import { buildThreadDeepLink } from './infrastructure/connectors/connector-command-helpers.js';
 import {
   applyConnectorGatewayAutostartPolicy,
-  isPreconfiguredConnectorAutostartEnabled,
+  classifyPreconfiguredConnectorAutostart,
   loadConnectorGatewayConfig,
   startConnectorGateway,
 } from './infrastructure/connectors/connector-gateway-bootstrap.js';
@@ -6127,15 +6127,24 @@ async function main(): Promise<void> {
 
   let connectorGatewayHandle: Awaited<ReturnType<typeof startConnectorGateway>> = null;
   let connectorReloadUnsub: (() => void) | null = null;
-  try {
-    const preconfiguredConnectorAutostart = isPreconfiguredConnectorAutostartEnabled(process.env);
-    if (!preconfiguredConnectorAutostart) {
+  const loadGatewayConfigWithAutostartPolicy = () => {
+    const rawConfig = loadConnectorGatewayConfig();
+    const autostartStatus = classifyPreconfiguredConnectorAutostart(rawConfig, process.env);
+    if (autostartStatus === 'disabled-credentials-suppressed') {
+      app.log.warn(
+        { nodeEnv: process.env.NODE_ENV ?? '(unset)', autostartStatus },
+        '[api] Preconfigured connector credentials present but suppressed by lifecycle policy; use the managed `pnpm start` runtime or intentionally set CONNECTOR_GATEWAY_AUTOSTART=1 in the launching process',
+      );
+    } else if (autostartStatus === 'disabled-no-credentials') {
       app.log.info(
-        { nodeEnv: process.env.NODE_ENV ?? '(unset)' },
-        '[api] Preconfigured connector autostart disabled; starting connector gateway in QR-only mode',
+        { nodeEnv: process.env.NODE_ENV ?? '(unset)', autostartStatus },
+        '[api] Preconfigured connector autostart disabled; no preconfigured credentials detected; starting connector gateway in QR-only mode',
       );
     }
-    const gatewayConfig = applyConnectorGatewayAutostartPolicy(loadConnectorGatewayConfig(), process.env);
+    return applyConnectorGatewayAutostartPolicy(rawConfig, process.env);
+  };
+  try {
+    const gatewayConfig = loadGatewayConfigWithAutostartPolicy();
     connectorGatewayHandle = await startConnectorGateway(gatewayConfig, gatewayDeps);
     if (connectorGatewayHandle) {
       wireGatewayHooks(connectorGatewayHandle);
@@ -6162,7 +6171,7 @@ async function main(): Promise<void> {
     async onRestart() {
       app.log.info('[api] F136: Hot-reloading connector gateway...');
       const newHandle = await restartConnectorGateway(connectorGatewayHandle, async () => {
-        const freshConfig = applyConnectorGatewayAutostartPolicy(loadConnectorGatewayConfig(), process.env);
+        const freshConfig = loadGatewayConfigWithAutostartPolicy();
         return startConnectorGateway(freshConfig, gatewayDeps);
       });
       if (newHandle) {

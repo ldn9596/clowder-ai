@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
   applyConnectorGatewayAutostartPolicy,
+  classifyPreconfiguredConnectorAutostart,
   isPreconfiguredConnectorAutostartEnabled,
   startConnectorGateway,
 } from '../dist/infrastructure/connectors/connector-gateway-bootstrap.js';
@@ -300,6 +301,30 @@ describe('ConnectorGateway Bootstrap', () => {
       }),
       false,
       'explicit override can fail-closed even in production',
+    );
+  });
+
+  it('distinguishes absent credentials from credentials suppressed by lifecycle policy', () => {
+    assert.equal(classifyPreconfiguredConnectorAutostart({}, {}), 'disabled-no-credentials');
+    assert.equal(
+      classifyPreconfiguredConnectorAutostart(
+        {
+          feishuAppId: 'cli_test',
+          feishuAppSecret: 'feishu-secret',
+        },
+        {},
+      ),
+      'disabled-credentials-suppressed',
+    );
+    assert.equal(
+      classifyPreconfiguredConnectorAutostart(
+        {
+          feishuAppId: 'cli_test',
+          feishuAppSecret: 'feishu-secret',
+        },
+        { CONNECTOR_GATEWAY_AUTOSTART: '1' },
+      ),
+      'enabled',
     );
   });
 
