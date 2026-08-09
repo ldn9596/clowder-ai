@@ -190,9 +190,8 @@ import { CommandRegistry } from './infrastructure/commands/CommandRegistry.js';
 import { parseManifestSlashCommands } from './infrastructure/commands/manifest-commands.js';
 import { buildThreadDeepLink } from './infrastructure/connectors/connector-command-helpers.js';
 import {
-  applyConnectorGatewayAutostartPolicy,
-  classifyPreconfiguredConnectorAutostart,
   loadConnectorGatewayConfig,
+  type PreconfiguredConnectorAutostartStatus,
   startConnectorGateway,
 } from './infrastructure/connectors/connector-gateway-bootstrap.js';
 import { restartConnectorGateway } from './infrastructure/connectors/connector-gateway-lifecycle.js';
@@ -6131,9 +6130,7 @@ async function main(): Promise<void> {
 
   let connectorGatewayHandle: Awaited<ReturnType<typeof startConnectorGateway>> = null;
   let connectorReloadUnsub: (() => void) | null = null;
-  const loadGatewayConfigWithAutostartPolicy = () => {
-    const rawConfig = loadConnectorGatewayConfig();
-    const autostartStatus = classifyPreconfiguredConnectorAutostart(rawConfig, process.env);
+  const logConnectorAutostartStatus = (autostartStatus: PreconfiguredConnectorAutostartStatus) => {
     if (autostartStatus === 'disabled-credentials-suppressed') {
       app.log.warn(
         { nodeEnv: process.env.NODE_ENV ?? '(unset)', autostartStatus },
@@ -6145,11 +6142,14 @@ async function main(): Promise<void> {
         '[api] Preconfigured connector autostart disabled; no preconfigured credentials detected; starting connector gateway in QR-only mode',
       );
     }
-    return applyConnectorGatewayAutostartPolicy(rawConfig, process.env);
+  };
+  const startGatewayWithAutostartPolicy = async () => {
+    const handle = await startConnectorGateway(loadConnectorGatewayConfig(), gatewayDeps);
+    if (handle) logConnectorAutostartStatus(handle.preconfiguredAutostartStatus);
+    return handle;
   };
   try {
-    const gatewayConfig = loadGatewayConfigWithAutostartPolicy();
-    connectorGatewayHandle = await startConnectorGateway(gatewayConfig, gatewayDeps);
+    connectorGatewayHandle = await startGatewayWithAutostartPolicy();
     if (connectorGatewayHandle) {
       wireGatewayHooks(connectorGatewayHandle);
       queueProcessor.setThreadMetaLookup(async (threadId) => {
@@ -6174,10 +6174,7 @@ async function main(): Promise<void> {
     debounceMs: 500,
     async onRestart() {
       app.log.info('[api] F136: Hot-reloading connector gateway...');
-      const newHandle = await restartConnectorGateway(connectorGatewayHandle, async () => {
-        const freshConfig = loadGatewayConfigWithAutostartPolicy();
-        return startConnectorGateway(freshConfig, gatewayDeps);
-      });
+      const newHandle = await restartConnectorGateway(connectorGatewayHandle, startGatewayWithAutostartPolicy);
       if (newHandle) {
         connectorGatewayHandle = newHandle;
         wireGatewayHooks(newHandle);
