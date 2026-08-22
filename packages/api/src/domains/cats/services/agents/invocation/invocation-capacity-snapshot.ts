@@ -222,15 +222,19 @@ export async function applyActiveSessionCapacityPin(options: {
   if (recoveryNote !== '') {
     await sessionChainStore.appendCapacityPinProvenance(active.id, recoveryNote);
   }
+  // Canonical evidence provenance: the recovery note appears exactly once,
+  // whether it was already persisted on the stored pin or is fresh to this
+  // invocation. The stored pin (merged atomically above) and the returned
+  // snapshot share this single deduplicated form.
+  const evidenceProvenance =
+    recoveryNote !== '' && !existingPin.provenance.includes(recoveryNote)
+      ? `${existingPin.provenance}${recoveryNote}`
+      : existingPin.provenance;
   return snapshotWithCapacity(snapshot, {
     windowTokens: existingPin.windowTokens,
     inputCeilingTokens: existingPin.inputCeilingTokens,
     source: existingPin.source,
-    provenance: `${existingPin.provenance}; session-pinned (shrink allowed, expansion requires rollover)${
-      pinBelowCarrierReport
-        ? `; carrier now reports ${freshReport.toLocaleString()} tokens — seal the session to recover if this pin was polluted`
-        : ''
-    }`,
+    provenance: `${evidenceProvenance}; session-pinned (shrink allowed, expansion requires rollover)`,
     actionable: existingPin.actionable,
   });
 }

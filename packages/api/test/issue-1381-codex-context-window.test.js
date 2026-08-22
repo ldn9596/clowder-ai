@@ -212,13 +212,18 @@ describe('issue #1381: Codex exec_json native/effective context window feedback 
     // deduplicated and without touching the numeric pin.
     const storedPin = store.get(active.id)?.capacityPin;
     assert.match(storedPin?.provenance, /carrier now reports 245,480 tokens — seal the session to recover/);
-    await runResumeRound(store, threadId);
+    const secondRound = await runResumeRound(store, threadId);
     const persistedPin = store.get(active.id)?.capacityPin;
     assert.equal(persistedPin?.windowTokens, 146_973);
     assert.equal(
       persistedPin?.provenance?.match(/seal the session to recover/g)?.length,
       1,
       'recovery hint must be persisted once, not re-appended every round',
+    );
+    assert.equal(
+      secondRound.capacity.provenance.match(/seal the session to recover/g)?.length,
+      1,
+      'the returned snapshot must carry the hint exactly once on repeat rounds',
     );
 
     // Explicit recovery: sealing the session ends the pin; the fresh session
