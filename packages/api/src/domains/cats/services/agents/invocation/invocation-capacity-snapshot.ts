@@ -189,7 +189,12 @@ export async function applyActiveSessionCapacityPin(options: {
   // it must not auto-expand. Surface the recoverable state; expansion still
   // requires an explicit seal/rollover.
   const freshReport = snapshot.lastReportedWindowTokens;
-  const pinBelowCarrierReport = resolvedPin && freshReport != null && freshReport >= resolvedPin.windowTokens;
+  // #1382 maintainer P1: compare the RAW report against the ACTIVE pin, never
+  // the resolved candidate — KNOWN_MIN floor-raising (or a manual member cap)
+  // can lift resolvedPin above the raw report and silently suppress a
+  // legitimate recovery hint. Strict >: a report equal to the pin agrees with
+  // it and proves nothing recoverable.
+  const pinBelowCarrierReport = freshReport != null && freshReport > existingPin.windowTokens;
   if (pinBelowCarrierReport) {
     log.warn(
       {
@@ -203,8 +208,18 @@ export async function applyActiveSessionCapacityPin(options: {
     );
   }
 
-  if (!isUsableCapacityPin(active.capacityPin)) {
-    await sessionChainStore.update(active.id, { capacityPin: existingPin, updatedAt: Date.now() });
+  // #1382 maintainer P1: persist the recovery hint on the STORED pin
+  // (deduplicated) — the returned snapshot is per-invocation while the Hub and
+  // digests read the session record. Numeric pin fields never change here.
+  const recoveryNote = pinBelowCarrierReport
+    ? `; carrier now reports ${freshReport.toLocaleString()} tokens — seal the session to recover if this pin was polluted`
+    : '';
+  const hintAlreadyPersisted = existingPin.provenance.includes('seal the session to recover');
+  if (!isUsableCapacityPin(active.capacityPin) || (recoveryNote !== '' && !hintAlreadyPersisted)) {
+    await sessionChainStore.update(active.id, {
+      capacityPin: { ...existingPin, provenance: `${existingPin.provenance}${recoveryNote}` },
+      updatedAt: Date.now(),
+    });
   }
   return snapshotWithCapacity(snapshot, {
     windowTokens: existingPin.windowTokens,

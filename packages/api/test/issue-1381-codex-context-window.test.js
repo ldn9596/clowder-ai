@@ -36,7 +36,8 @@ describe('issue #1381: Codex exec_json native/effective context window feedback 
       ...(accountRef ? { accountRef } : {}),
       provider: 'openai',
       defaultModel,
-      contextWindow,
+      // null = Auto mode (no manual member window; catalog/report-owned).
+      ...(contextWindow === null ? {} : { contextWindow }),
       mcpSupport: false,
       roleDescription: 'test',
       personality: 'test',
@@ -206,6 +207,20 @@ describe('issue #1381: Codex exec_json native/effective context window feedback 
     assert.match(clamped.capacity.provenance, /seal the session to recover/);
     assert.equal(store.get(active.id)?.capacityPin?.windowTokens, 146_973);
 
+    // Maintainer P1: the hint must also land on the STORED pin (the Hub and
+    // digests read the session record, not the per-invocation snapshot),
+    // deduplicated and without touching the numeric pin.
+    const storedPin = store.get(active.id)?.capacityPin;
+    assert.match(storedPin?.provenance, /carrier now reports 245,480 tokens — seal the session to recover/);
+    await runResumeRound(store, threadId);
+    const persistedPin = store.get(active.id)?.capacityPin;
+    assert.equal(persistedPin?.windowTokens, 146_973);
+    assert.equal(
+      persistedPin?.provenance?.match(/seal the session to recover/g)?.length,
+      1,
+      'recovery hint must be persisted once, not re-appended every round',
+    );
+
     // Explicit recovery: sealing the session ends the pin; the fresh session
     // adopts the carrier-reported capacity on its first invocation.
     store.update(active.id, { status: 'sealed' });
@@ -241,13 +256,51 @@ describe('issue #1381: Codex exec_json native/effective context window feedback 
     assert.equal(later.capacity.windowTokens, 200_000);
     assert.match(later.capacity.provenance, /session-pinned/);
     assert.equal(store.get(active.id)?.capacityPin?.windowTokens, 200_000);
+    // The larger raw report exceeds the active pin → the recovery hint is
+    // persisted on the stored record (the pin itself stays clamped).
+    assert.match(store.get(active.id)?.capacityPin?.provenance, /seal the session to recover/);
+  });
+
+  it('gates the recovery hint on the raw report vs the active pin (manual cap + floor-raised candidate)', async () => {
+    // Maintainer P1 exact counterexample: manual 258400 + claude-fable-5 +
+    // active pin 200000 + raw report 245480. The KNOWN_MIN floor lifts the
+    // resolver candidate past the raw report (manual branch → 258400), so the
+    // old predicate (report >= resolvedPin) silently produced no hint. The pin
+    // correctly stays 200000; the hint must fire because the RAW report
+    // exceeds the ACTIVE pin.
+    registerTestCat(undefined, 'claude-fable-5');
+    const store = new SessionChainStore();
+    const threadId = 'thread-issue-1381-floor-manual';
+    const active = store.create({
+      cliSessionId: 'cli-issue-1381-floor-manual',
+      threadId,
+      catId: TEST_CAT_ID,
+      userId: 'user-1',
+    });
+    store.update(active.id, {
+      capacityPin: {
+        windowTokens: 200_000,
+        inputCeilingTokens: 184_000,
+        source: 'reported',
+        provenance: 'Carrier reported 200,000 tokens',
+        actionable: true,
+      },
+    });
+
+    const clamped = await runResumeRound(store, threadId, EFFECTIVE_WINDOW);
+    assert.equal(clamped.capacity.windowTokens, 200_000);
+    assert.equal(store.get(active.id)?.capacityPin?.windowTokens, 200_000);
+    assert.match(store.get(active.id)?.capacityPin?.provenance, /seal the session to recover/);
   });
 
   it('does not expand a pin from a floor-raised catalog value without raw provider proof', async () => {
-    // claude-fable-5: KNOWN_MIN floor raises a stale 200K CLI report to 1M in
-    // the resolver, but the raw report never proved 1M — the pin must not
-    // expand on that basis.
-    registerTestCat(undefined, 'claude-fable-5');
+    // claude-fable-5 in Auto mode (no manual member window): KNOWN_MIN floor
+    // raises any raw report below 1M to 1M in the resolver — the resolved
+    // candidate therefore exceeds the active 200K pin in BOTH controls, so
+    // only the raw report can distinguish them. Positive: raw 245480 > pin →
+    // hint persisted. Negative: raw 200000 == pin → no hint. In neither case
+    // may the pin expand on the floor-raised value.
+    registerTestCat(null, 'claude-fable-5');
     const store = new SessionChainStore();
     const threadId = 'thread-issue-1381-floor';
     const active = store.create({
@@ -266,9 +319,36 @@ describe('issue #1381: Codex exec_json native/effective context window feedback 
       },
     });
 
-    const recovered = await runResumeRound(store, threadId, 200_000);
-    assert.equal(recovered.capacity.windowTokens, 200_000);
+    const positive = await runResumeRound(store, threadId, EFFECTIVE_WINDOW);
+    assert.equal(positive.capacity.windowTokens, 200_000);
     assert.equal(store.get(active.id)?.capacityPin?.windowTokens, 200_000);
+    assert.match(store.get(active.id)?.capacityPin?.provenance, /seal the session to recover/);
+
+    // Negative control on a fresh session: raw report equal to the pin proves
+    // nothing recoverable even after floor-raising — no hint may appear.
+    registerTestCat(null, 'claude-fable-5');
+    const controlStore = new SessionChainStore();
+    const controlThreadId = 'thread-issue-1381-floor-control';
+    const control = controlStore.create({
+      cliSessionId: 'cli-issue-1381-floor-control',
+      threadId: controlThreadId,
+      catId: TEST_CAT_ID,
+      userId: 'user-1',
+    });
+    controlStore.update(control.id, {
+      capacityPin: {
+        windowTokens: 200_000,
+        inputCeilingTokens: 184_000,
+        source: 'reported',
+        provenance: 'Carrier reported 200,000 tokens',
+        actionable: true,
+      },
+    });
+
+    const negative = await runResumeRound(controlStore, controlThreadId, 200_000);
+    assert.equal(negative.capacity.windowTokens, 200_000);
+    assert.equal(controlStore.get(control.id)?.capacityPin?.windowTokens, 200_000);
+    assert.doesNotMatch(controlStore.get(control.id)?.capacityPin?.provenance, /seal the session to recover/);
   });
 
   it('keeps expansion gated on rollover when no fresh carrier report exists', async () => {
