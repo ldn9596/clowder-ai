@@ -452,7 +452,10 @@ describe('issue #1381: Codex exec_json native/effective context window feedback 
       const sessionKey = `user-1:${TEST_CAT_ID}:${threadId}`;
       const deps = {
         registry: {
-          create: () => ({ invocationId: `inv-bridge-${++invocationCounter}`, callbackToken: `tok-${invocationCounter}` }),
+          create: () => ({
+            invocationId: `inv-bridge-${++invocationCounter}`,
+            callbackToken: `tok-${invocationCounter}`,
+          }),
           verify: async () => ({ ok: false, reason: 'unknown_invocation' }),
         },
         sessionManager: {
@@ -535,10 +538,7 @@ describe('issue #1381: Codex exec_json native/effective context window feedback 
           msgs.some((m) => m.type === 'done'),
           `round ${round}: invocation must complete`,
         );
-        assert.ok(
-          !msgs.some((m) => m.type === 'error'),
-          `round ${round}: invocation must not error`,
-        );
+        assert.ok(!msgs.some((m) => m.type === 'error'), `round ${round}: invocation must not error`);
         assert.equal(
           store.get(active.id)?.capacityPin?.windowTokens,
           EFFECTIVE_WINDOW,
