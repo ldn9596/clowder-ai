@@ -655,7 +655,18 @@ describe('issue #1381: Codex exec_json native/effective context window feedback 
       if (bridgeGlobalConfigRoot) await rm(bridgeGlobalConfigRoot, { recursive: true, force: true });
     });
 
-    it('keeps the injected Codex argv window at the configured native window across 12 bridge resumes', async () => {
+    async function withAmbientCodexCarrier(ambientCarrier, run) {
+      const savedCarrier = process.env.CAT_CAFE_CODEX_CARRIER;
+      process.env.CAT_CAFE_CODEX_CARRIER = ambientCarrier;
+      try {
+        return await run();
+      } finally {
+        if (savedCarrier === undefined) delete process.env.CAT_CAFE_CODEX_CARRIER;
+        else process.env.CAT_CAFE_CODEX_CARRIER = savedCarrier;
+      }
+    }
+
+    async function runProductionBridge() {
       // No accountRef: the bridge drives real invoke-single-cat account
       // resolution, which hard-fails on a bound account that does not exist in
       // the isolated global config. Template openai variants also leave
@@ -678,6 +689,10 @@ describe('issue #1381: Codex exec_json native/effective context window feedback 
       const spawnFn = mock.fn(() => currentProc);
       const service = new CodexAgentService({
         catId: TEST_CAT_ID,
+        // This regression owns the exec_json production bridge. Never let a
+        // supported ambient app_server setting bypass the injected spawnFn
+        // and erase the 12-resume proof.
+        carrierMode: 'exec_json',
         l0CompilerFn: fakeL0Compiler,
         spawnFn,
         // resolveCliCommand probes the binary's existence before spawn even
@@ -792,6 +807,16 @@ describe('issue #1381: Codex exec_json native/effective context window feedback 
           `round ${round}: session pin must stay at ${EFFECTIVE_WINDOW}, not shrink recursively`,
         );
       }
-    });
+    }
+
+    for (const ambientCarrier of ['app_server', 'exec_json']) {
+      it(
+        `keeps the injected Codex argv window at the configured native window across 12 bridge resumes ` +
+          `with ambient ${ambientCarrier}`,
+        async () => {
+          await withAmbientCodexCarrier(ambientCarrier, runProductionBridge);
+        },
+      );
+    }
   });
 });
