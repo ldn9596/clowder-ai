@@ -7,7 +7,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import type { CatId, HybridProgress, SessionPolicySnapshot, SessionRecord } from '@cat-cafe/shared';
+import type { CatId, HybridProgress, SessionCapacityPin, SessionPolicySnapshot, SessionRecord } from '@cat-cafe/shared';
 import type { StoreReadOptions } from './StoreReadOptions.js';
 import { throwIfStoreReadAborted } from './StoreReadOptions.js';
 
@@ -131,6 +131,15 @@ export interface ISessionChainStore {
    * or null when nothing was written.
    */
   appendCapacityPinProvenance(id: string, note: string): SessionRecord | null | Promise<SessionRecord | null>;
+  /**
+   * #1382 maintainer P1: atomically apply a shrink-only capacity pin — the
+   * candidate is written only when no usable pin is stored or its windowTokens
+   * is <= the CURRENT stored pin's. A stored smaller constraint is never
+   * overwritten by a delayed larger candidate (one-way pin invariant).
+   * Returns the record as it stands after the atomic decision, or null when
+   * the session does not exist.
+   */
+  shrinkCapacityPin(id: string, candidate: SessionCapacityPin): SessionRecord | null | Promise<SessionRecord | null>;
   /** F118: List IDs of all sessions currently in 'sealing' status (for global reaper). */
   listSealingSessions(): string[] | Promise<string[]>;
 }
@@ -499,6 +508,25 @@ export class SessionChainStore implements ISessionChainStore {
     // Merge onto the CURRENT stored pin — never a caller-stale copy, so a
     // concurrent shrink is never undone (synchronous store = atomic here).
     record.capacityPin = { ...pin, provenance: `${pin.provenance}${note}` };
+    record.updatedAt = Date.now();
+    return record;
+  }
+
+  shrinkCapacityPin(id: string, candidate: SessionCapacityPin): SessionRecord | null {
+    const record = this.records.get(id);
+    if (!record) return null;
+    const current = record.capacityPin;
+    if (
+      current &&
+      Number.isFinite(current.windowTokens) &&
+      current.windowTokens > 0 &&
+      candidate.windowTokens > current.windowTokens
+    ) {
+      // A smaller constraint is already stored — never expand (synchronous
+      // store = the compare-and-write is atomic here).
+      return record;
+    }
+    record.capacityPin = candidate;
     record.updatedAt = Date.now();
     return record;
   }

@@ -408,6 +408,58 @@ describe('issue #1381: Codex exec_json native/effective context window feedback 
     );
   });
 
+  it('never reorders concurrent shrinks into an expansion (200K pin, 150K lands, delayed 180K)', async () => {
+    // Maintainer P1 probe, one level up from the provenance merge: invocation
+    // A reads pin 200000 and prepares a genuine shrink to 180000; invocation
+    // B's smaller shrink to 150000 lands first; A's delayed write must not
+    // restore 180000. Final pin stays 150000 and A's returned view clamps.
+    registerTestCat();
+    const store = new SessionChainStore();
+    const threadId = 'thread-issue-1381-shrink-reorder';
+    const active = store.create({
+      cliSessionId: 'cli-issue-1381-shrink-reorder',
+      threadId,
+      catId: TEST_CAT_ID,
+      userId: 'user-1',
+    });
+    store.update(active.id, {
+      capacityPin: {
+        windowTokens: 200_000,
+        inputCeilingTokens: 184_000,
+        source: 'reported',
+        provenance: 'Carrier reported 200,000 tokens',
+        actionable: true,
+      },
+    });
+
+    const atomicShrink = store.shrinkCapacityPin.bind(store);
+    store.shrinkCapacityPin = (id, candidate) => {
+      if (candidate.windowTokens === 180_000) {
+        // Invocation B's smaller shrink lands while A is paused at the write.
+        store.update(id, {
+          capacityPin: {
+            windowTokens: 150_000,
+            inputCeilingTokens: 134_000,
+            source: 'reported',
+            provenance: 'Carrier reported 150,000 tokens',
+            actionable: true,
+          },
+          updatedAt: Date.now(),
+        });
+      }
+      return atomicShrink(id, candidate);
+    };
+
+    const shrunk = await runResumeRound(store, threadId, 180_000);
+    const finalPin = store.get(active.id)?.capacityPin;
+    assert.equal(finalPin?.windowTokens, 150_000, 'delayed 180K must not overwrite the concurrent 150K');
+    assert.equal(
+      shrunk.capacity.windowTokens,
+      150_000,
+      "the losing invocation's returned view clamps to the stored smaller pin",
+    );
+  });
+
   it('keeps expansion gated on rollover when no fresh carrier report exists', async () => {
     registerTestCat();
     const store = new SessionChainStore();

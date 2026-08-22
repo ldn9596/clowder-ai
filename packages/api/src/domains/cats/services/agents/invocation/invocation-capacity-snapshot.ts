@@ -174,12 +174,41 @@ export async function applyActiveSessionCapacityPin(options: {
 
   if (!existingPin) {
     if (!resolvedPin) return snapshot;
-    await sessionChainStore.update(active.id, { capacityPin: resolvedPin, updatedAt: Date.now() });
+    // #1382 maintainer P1: even first-pin establishment goes through the
+    // atomic shrink-only write — a concurrent invocation may have landed a
+    // smaller pin between our read and this write.
+    const applied = await sessionChainStore.shrinkCapacityPin(active.id, resolvedPin);
+    const currentPin = applied?.capacityPin;
+    if (currentPin && isUsableCapacityPin(currentPin) && currentPin.windowTokens < snapshot.capacity.windowTokens) {
+      return snapshotWithCapacity(snapshot, {
+        windowTokens: currentPin.windowTokens,
+        inputCeilingTokens: currentPin.inputCeilingTokens,
+        source: currentPin.source,
+        provenance: `${currentPin.provenance}; session-pinned (shrink allowed, expansion requires rollover)`,
+        actionable: currentPin.actionable,
+      });
+    }
     return snapshot;
   }
 
   if (resolvedPin && resolvedPin.windowTokens <= existingPin.windowTokens) {
-    await sessionChainStore.update(active.id, { capacityPin: resolvedPin, updatedAt: Date.now() });
+    // #1382 maintainer P1: the numeric shrink applies atomically against the
+    // CURRENT stored pin — two concurrent shrink candidates must never
+    // reorder into an expansion (delayed 180K must not overwrite a landed
+    // 150K).
+    const applied = await sessionChainStore.shrinkCapacityPin(active.id, resolvedPin);
+    const currentPin = applied?.capacityPin;
+    if (currentPin && isUsableCapacityPin(currentPin) && currentPin.windowTokens < resolvedPin.windowTokens) {
+      // A concurrent smaller shrink won the race — clamp this invocation's
+      // view to the stricter stored pin, not the candidate we prepared.
+      return snapshotWithCapacity(snapshot, {
+        windowTokens: currentPin.windowTokens,
+        inputCeilingTokens: currentPin.inputCeilingTokens,
+        source: currentPin.source,
+        provenance: `${currentPin.provenance}; session-pinned (shrink allowed, expansion requires rollover)`,
+        actionable: currentPin.actionable,
+      });
+    }
     return snapshotWithCapacity(snapshot, snapshot.capacity);
   }
 
@@ -217,7 +246,13 @@ export async function applyActiveSessionCapacityPin(options: {
     ? `; carrier now reports ${freshReport.toLocaleString()} tokens — seal the session to recover if this pin was polluted`
     : '';
   if (!isUsableCapacityPin(active.capacityPin)) {
-    await sessionChainStore.update(active.id, { capacityPin: existingPin, updatedAt: Date.now() });
+    // Same one-way fence for the upgrade materialization: a concurrent usable
+    // pin that constrains harder must survive.
+    const applied = await sessionChainStore.shrinkCapacityPin(active.id, existingPin);
+    const currentPin = applied?.capacityPin;
+    if (currentPin && isUsableCapacityPin(currentPin) && currentPin.windowTokens < existingPin.windowTokens) {
+      existingPin = currentPin;
+    }
   }
   if (recoveryNote !== '') {
     await sessionChainStore.appendCapacityPinProvenance(active.id, recoveryNote);
