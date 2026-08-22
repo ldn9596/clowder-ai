@@ -123,6 +123,14 @@ export interface ISessionChainStore {
   getByChainKey(chainKey: string): SessionRecord | null | Promise<SessionRecord | null>;
   /** Atomically increment compressionCount and return the new value. Returns null if session not found. */
   incrementCompressionCount(id: string): number | null | Promise<number | null>;
+  /**
+   * #1382 maintainer P1: atomically merge a provenance note into the STORED
+   * capacityPin without copying caller-stale numeric fields — a concurrent
+   * pin shrink must never be undone by a delayed provenance write. Dedup:
+   * no-op when the exact note is already present. Returns the updated record,
+   * or null when nothing was written.
+   */
+  appendCapacityPinProvenance(id: string, note: string): SessionRecord | null | Promise<SessionRecord | null>;
   /** F118: List IDs of all sessions currently in 'sealing' status (for global reaper). */
   listSealingSessions(): string[] | Promise<string[]>;
 }
@@ -481,6 +489,18 @@ export class SessionChainStore implements ISessionChainStore {
     record.compressionCount += 1;
     record.updatedAt = Date.now();
     return record.compressionCount;
+  }
+
+  appendCapacityPinProvenance(id: string, note: string): SessionRecord | null {
+    const record = this.records.get(id);
+    if (!record?.capacityPin) return null;
+    const pin = record.capacityPin;
+    if (typeof pin.provenance !== 'string' || pin.provenance.includes(note)) return null;
+    // Merge onto the CURRENT stored pin — never a caller-stale copy, so a
+    // concurrent shrink is never undone (synchronous store = atomic here).
+    record.capacityPin = { ...pin, provenance: `${pin.provenance}${note}` };
+    record.updatedAt = Date.now();
+    return record;
   }
 
   listSealingSessions(): string[] {

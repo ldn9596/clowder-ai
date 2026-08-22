@@ -351,6 +351,58 @@ describe('issue #1381: Codex exec_json native/effective context window feedback 
     assert.doesNotMatch(controlStore.get(control.id)?.capacityPin?.provenance, /seal the session to recover/);
   });
 
+  it('merges the persisted recovery hint onto the current pin — a concurrent shrink is never undone', async () => {
+    // Maintainer P1 interleaving probe: invocation A reads active pin 200000
+    // and pauses at the recovery-note write for raw report 245480; invocation
+    // B lands a genuine shrink to 150000; A's delayed write must NOT restore
+    // the stale 200000. The final pin stays 150000 with the hint present
+    // exactly once.
+    registerTestCat();
+    const store = new SessionChainStore();
+    const threadId = 'thread-issue-1381-lost-update';
+    const active = store.create({
+      cliSessionId: 'cli-issue-1381-lost-update',
+      threadId,
+      catId: TEST_CAT_ID,
+      userId: 'user-1',
+    });
+    store.update(active.id, {
+      capacityPin: {
+        windowTokens: 200_000,
+        inputCeilingTokens: 184_000,
+        source: 'reported',
+        provenance: 'Carrier reported 200,000 tokens',
+        actionable: true,
+      },
+    });
+
+    const atomicAppend = store.appendCapacityPinProvenance.bind(store);
+    store.appendCapacityPinProvenance = (id, note) => {
+      // Invocation B's genuine shrink lands while A is paused at the note write.
+      store.update(id, {
+        capacityPin: {
+          windowTokens: 150_000,
+          inputCeilingTokens: 134_000,
+          source: 'reported',
+          provenance: 'Carrier reported 150,000 tokens',
+          actionable: true,
+        },
+        updatedAt: Date.now(),
+      });
+      return atomicAppend(id, note);
+    };
+
+    await runResumeRound(store, threadId, EFFECTIVE_WINDOW);
+    const finalPin = store.get(active.id)?.capacityPin;
+    assert.equal(finalPin?.windowTokens, 150_000, 'delayed note write must not undo the concurrent shrink');
+    assert.match(finalPin?.provenance, /carrier now reports 245,480 tokens — seal the session to recover/);
+    assert.equal(
+      finalPin?.provenance?.match(/seal the session to recover/g)?.length,
+      1,
+      'recovery hint must be present exactly once',
+    );
+  });
+
   it('keeps expansion gated on rollover when no fresh carrier report exists', async () => {
     registerTestCat();
     const store = new SessionChainStore();

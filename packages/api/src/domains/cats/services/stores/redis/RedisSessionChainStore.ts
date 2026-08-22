@@ -226,6 +226,25 @@ redis.call('HSET', KEYS[1], 'updatedAt', ARGV[1])
 return newCount
 `;
 
+/**
+ * #1382 maintainer P1: atomically merge a provenance note into the stored
+ * capacityPin. The script re-reads the CURRENT pin inside the same Redis
+ * execution, so a delayed writer can never undo a concurrent shrink by
+ * writing back a stale pin object. Dedup lives here: an already-present note
+ * is not re-appended. KEYS[1] = detail key; ARGV[1] = note; ARGV[2] =
+ * updatedAt. Returns 1 when appended, 0 when skipped.
+ */
+const APPEND_CAPACITY_PIN_PROVENANCE_LUA = `
+local data = redis.call('HGET', KEYS[1], 'capacityPin')
+if not data then return 0 end
+local ok, pin = pcall(cjson.decode, data)
+if not ok or type(pin) ~= 'table' or type(pin['provenance']) ~= 'string' then return 0 end
+if string.find(pin['provenance'], ARGV[1], 1, true) then return 0 end
+pin['provenance'] = pin['provenance'] .. ARGV[1]
+redis.call('HSET', KEYS[1], 'capacityPin', cjson.encode(pin), 'updatedAt', ARGV[2])
+return 1
+`;
+
 export class RedisSessionChainStore implements ISessionChainStore {
   private readonly redis: RedisClient;
   private threadIndexReady = false;
@@ -728,6 +747,15 @@ export class RedisSessionChainStore implements ISessionChainStore {
     const result = await this.redis.eval(INCR_COMPRESSION_LUA, 1, detailKey, String(Date.now()));
     const code = result as number;
     return code < 0 ? null : code;
+  }
+
+  async appendCapacityPinProvenance(id: string, note: string): Promise<SessionRecord | null> {
+    const detailKey = SessionChainKeys.detail(id);
+    // Lua: atomic read-merge-write against the CURRENT stored pin (see the
+    // script comment) — a concurrent shrink is never undone by stale numerics.
+    const result = await this.redis.eval(APPEND_CAPACITY_PIN_PROVENANCE_LUA, 1, detailKey, note, String(Date.now()));
+    if ((result as number) !== 1) return null;
+    return this.get(id);
   }
 
   async listSealingSessions(): Promise<string[]> {

@@ -208,18 +208,19 @@ export async function applyActiveSessionCapacityPin(options: {
     );
   }
 
-  // #1382 maintainer P1: persist the recovery hint on the STORED pin
-  // (deduplicated) — the returned snapshot is per-invocation while the Hub and
-  // digests read the session record. Numeric pin fields never change here.
+  // #1382 maintainer P1: persist the recovery hint on the STORED pin — the
+  // returned snapshot is per-invocation while the Hub and digests read the
+  // session record. The note is merged atomically against the CURRENT stored
+  // pin: writing back this caller's stale pin object could undo a concurrent
+  // shrink (lost-update race). Dedup lives in the store operation.
   const recoveryNote = pinBelowCarrierReport
     ? `; carrier now reports ${freshReport.toLocaleString()} tokens — seal the session to recover if this pin was polluted`
     : '';
-  const hintAlreadyPersisted = existingPin.provenance.includes('seal the session to recover');
-  if (!isUsableCapacityPin(active.capacityPin) || (recoveryNote !== '' && !hintAlreadyPersisted)) {
-    await sessionChainStore.update(active.id, {
-      capacityPin: { ...existingPin, provenance: `${existingPin.provenance}${recoveryNote}` },
-      updatedAt: Date.now(),
-    });
+  if (!isUsableCapacityPin(active.capacityPin)) {
+    await sessionChainStore.update(active.id, { capacityPin: existingPin, updatedAt: Date.now() });
+  }
+  if (recoveryNote !== '') {
+    await sessionChainStore.appendCapacityPinProvenance(active.id, recoveryNote);
   }
   return snapshotWithCapacity(snapshot, {
     windowTokens: existingPin.windowTokens,
