@@ -440,6 +440,13 @@ describe('issue #1381: Codex exec_json native/effective context window feedback 
         catId: TEST_CAT_ID,
         l0CompilerFn: fakeL0Compiler,
         spawnFn,
+        // resolveCliCommand probes the binary's existence before spawn even
+        // with an injected spawnFn, and the real codex CLI is absent on CI
+        // runners (codex-agent-service.test.js is not in the public suite, so
+        // only this bridge file hits that gate). Point at the running node
+        // binary — guaranteed resolvable everywhere; the mock spawnFn means
+        // it is never actually executed.
+        cliCommand: process.execPath,
         model: 'gpt-5.6-sol',
         auditLog: { append: async () => {} },
         rawArchive: { append: async () => {}, getPath: () => undefined },
