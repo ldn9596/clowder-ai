@@ -1,4 +1,26 @@
 /**
+ * #1382 review P2: stable identity of the capacity-pin recovery note. A pin
+ * carries at most ONE recovery instruction — when the carrier's reported
+ * number jitters (245480 → 245481), the previous note is replaced in place
+ * rather than appended, so provenance never grows unbounded.
+ */
+export const CAPACITY_PIN_RECOVERY_NOTE_PATTERN =
+  /; carrier now reports [\d,]+ tokens — seal the session to recover if this pin was polluted/;
+
+/**
+ * Upsert the recovery note into a provenance string: exact note already
+ * present → unchanged; an older note with a different report number →
+ * replaced in place; otherwise appended.
+ */
+export function upsertCapacityPinRecoveryNote(provenance: string, note: string): string {
+  if (provenance.includes(note)) return provenance;
+  if (CAPACITY_PIN_RECOVERY_NOTE_PATTERN.test(provenance)) {
+    return provenance.replace(CAPACITY_PIN_RECOVERY_NOTE_PATTERN, note);
+  }
+  return `${provenance}${note}`;
+}
+
+/**
  * Session Chain Store
  * F24: Thread → N Sessions per cat, context health tracking.
  *
@@ -507,7 +529,9 @@ export class SessionChainStore implements ISessionChainStore {
     if (typeof pin.provenance !== 'string' || pin.provenance.includes(note)) return null;
     // Merge onto the CURRENT stored pin — never a caller-stale copy, so a
     // concurrent shrink is never undone (synchronous store = atomic here).
-    record.capacityPin = { ...pin, provenance: `${pin.provenance}${note}` };
+    // upsert = semantic dedup: a jittered report number replaces the previous
+    // note in place instead of growing provenance unbounded.
+    record.capacityPin = { ...pin, provenance: upsertCapacityPinRecoveryNote(pin.provenance, note) };
     record.updatedAt = Date.now();
     return record;
   }

@@ -240,7 +240,16 @@ if not data then return 0 end
 local ok, pin = pcall(cjson.decode, data)
 if not ok or type(pin) ~= 'table' or type(pin['provenance']) ~= 'string' then return 0 end
 if string.find(pin['provenance'], ARGV[1], 1, true) then return 0 end
-pin['provenance'] = pin['provenance'] .. ARGV[1]
+-- #1382 review P2: semantic dedup — a jittered report number replaces the
+-- previous recovery note in place (one pin carries at most one recovery
+-- instruction) instead of growing provenance unbounded.
+local pattern = "; carrier now reports [%d,]+ tokens .-seal the session to recover if this pin was polluted"
+local replaced, count = string.gsub(pin['provenance'], pattern, ARGV[1], 1)
+if count == 0 then
+  pin['provenance'] = pin['provenance'] .. ARGV[1]
+else
+  pin['provenance'] = replaced
+end
 redis.call('HSET', KEYS[1], 'capacityPin', cjson.encode(pin), 'updatedAt', ARGV[2])
 return 1
 `;

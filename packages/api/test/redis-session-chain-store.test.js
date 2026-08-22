@@ -163,6 +163,16 @@ describe('RedisSessionChainStore', { skip: redisIsolationSkipReason(REDIS_URL) }
     current = (await store.get(record.id))?.capacityPin;
     assert.equal(current?.provenance?.match(/seal the session to recover/g)?.length, 1);
 
+    // Semantic dedup: a jittered report number replaces the note in place —
+    // one pin carries at most one recovery instruction.
+    const jitteredNote = '; carrier now reports 245,481 tokens — seal the session to recover if this pin was polluted';
+    await store.appendCapacityPinProvenance(record.id, jitteredNote);
+    current = (await store.get(record.id))?.capacityPin;
+    assert.equal(current?.windowTokens, 150_000);
+    assert.equal(current?.provenance?.match(/seal the session to recover/g)?.length, 1);
+    assert.ok(current?.provenance?.includes('245,481'), 'latest report number wins');
+    assert.ok(!current?.provenance?.includes('245,480'), 'stale report number replaced');
+
     // No stored pin → null, nothing written.
     const bare = await store.create({ ...BASE_INPUT, cliSessionId: 'cli-sess-bare' });
     assert.equal(await store.appendCapacityPinProvenance(bare.id, note), null);

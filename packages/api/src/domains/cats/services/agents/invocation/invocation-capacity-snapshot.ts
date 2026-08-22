@@ -39,6 +39,7 @@ import { shouldTakeAction } from '../../../../../config/session-strategy.js';
 import { createModuleLogger } from '../../../../../infrastructure/logger.js';
 import type { ISessionSealer } from '../../session/SessionSealer.js';
 import type { ISessionChainStore } from '../../stores/ports/SessionChainStore.js';
+import { upsertCapacityPinRecoveryNote } from '../../stores/ports/SessionChainStore.js';
 import {
   type AgentContextBinding,
   type AgentContextCapability,
@@ -257,14 +258,22 @@ export async function applyActiveSessionCapacityPin(options: {
   if (recoveryNote !== '') {
     await sessionChainStore.appendCapacityPinProvenance(active.id, recoveryNote);
   }
+  // #1382 review P1: build the returned snapshot from the CURRENT stored pin
+  // — the linearization point of the atomic writes above. A concurrent
+  // smaller shrink must shape this invocation's returned view too, not just
+  // the store (probe: stored 150000 while the caller still returned 200000).
+  const currentRecord = await sessionChainStore.get(active.id);
+  const currentPin = currentRecord?.capacityPin;
+  if (currentPin && isUsableCapacityPin(currentPin) && currentPin.windowTokens < existingPin.windowTokens) {
+    existingPin = currentPin;
+  }
   // Canonical evidence provenance: the recovery note appears exactly once,
   // whether it was already persisted on the stored pin or is fresh to this
-  // invocation. The stored pin (merged atomically above) and the returned
+  // invocation, and a jittered report number replaces the older note in
+  // place. The stored pin (merged atomically above) and the returned
   // snapshot share this single deduplicated form.
   const evidenceProvenance =
-    recoveryNote !== '' && !existingPin.provenance.includes(recoveryNote)
-      ? `${existingPin.provenance}${recoveryNote}`
-      : existingPin.provenance;
+    recoveryNote !== '' ? upsertCapacityPinRecoveryNote(existingPin.provenance, recoveryNote) : existingPin.provenance;
   return snapshotWithCapacity(snapshot, {
     windowTokens: existingPin.windowTokens,
     inputCeilingTokens: existingPin.inputCeilingTokens,

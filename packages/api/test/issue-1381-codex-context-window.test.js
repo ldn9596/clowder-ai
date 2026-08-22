@@ -397,7 +397,7 @@ describe('issue #1381: Codex exec_json native/effective context window feedback 
       return atomicAppend(id, note);
     };
 
-    await runResumeRound(store, threadId, EFFECTIVE_WINDOW);
+    const returned = await runResumeRound(store, threadId, EFFECTIVE_WINDOW);
     const finalPin = store.get(active.id)?.capacityPin;
     assert.equal(finalPin?.windowTokens, 150_000, 'delayed note write must not undo the concurrent shrink');
     assert.match(finalPin?.provenance, /carrier now reports 245,480 tokens — seal the session to recover/);
@@ -406,6 +406,57 @@ describe('issue #1381: Codex exec_json native/effective context window feedback 
       1,
       'recovery hint must be present exactly once',
     );
+    // 太阳猫 review P1: the returned snapshot must be built from the current
+    // (post-race) pin too — not the caller's stale 200000 read.
+    assert.equal(returned.capacity.windowTokens, 150_000, 'returned view must reflect the concurrent shrink');
+    assert.equal(
+      returned.capacity.provenance.match(/seal the session to recover/g)?.length,
+      1,
+      'returned provenance carries the hint exactly once',
+    );
+  });
+
+  it('keeps exactly one recovery instruction per pin when the larger report number jitters', async () => {
+    // 太阳猫 review P2: exact-string dedup treats 245480 → 245481 as different
+    // notes and appends twice. The recovery instruction must be a stable
+    // singleton — the latest report number replaces the previous note in
+    // place, on both the stored pin and the returned snapshot.
+    registerTestCat();
+    const store = new SessionChainStore();
+    const threadId = 'thread-issue-1381-hint-jitter';
+    const active = store.create({
+      cliSessionId: 'cli-issue-1381-hint-jitter',
+      threadId,
+      catId: TEST_CAT_ID,
+      userId: 'user-1',
+    });
+    store.update(active.id, {
+      capacityPin: {
+        windowTokens: 146_973,
+        inputCeilingTokens: 130_973,
+        source: 'reported',
+        provenance: 'Carrier reported 146,973 tokens (polluted by pre-fix feedback loop)',
+        actionable: true,
+      },
+    });
+
+    await runResumeRound(store, threadId, 245_480);
+    const jittered = await runResumeRound(store, threadId, 245_481);
+    const storedPin = store.get(active.id)?.capacityPin;
+    assert.equal(storedPin?.windowTokens, 146_973);
+    assert.equal(
+      storedPin?.provenance?.match(/seal the session to recover/g)?.length,
+      1,
+      'a jittered report must replace the note in place, not append a second one',
+    );
+    assert.match(storedPin?.provenance, /245,481/, 'the stored note carries the latest report number');
+    assert.doesNotMatch(storedPin?.provenance, /245,480/, 'the stale report number is replaced');
+    assert.equal(
+      jittered.capacity.provenance.match(/seal the session to recover/g)?.length,
+      1,
+      'returned snapshot carries exactly one recovery instruction',
+    );
+    assert.match(jittered.capacity.provenance, /245,481/);
   });
 
   it('never reorders concurrent shrinks into an expansion (200K pin, 150K lands, delayed 180K)', async () => {
