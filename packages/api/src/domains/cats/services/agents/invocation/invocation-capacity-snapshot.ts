@@ -5,7 +5,18 @@
  * assembly, lifecycle checks, and provider-native controls consume that same
  * snapshot. A trusted carrier report may lower it during the invocation. The
  * active session persists that resolved capacity and may shrink, but cannot
- * expand until session rollover.
+ * expand until session rollover — not even when a later report exceeds the
+ * pin, because that state cannot distinguish a polluted pin (#1381) from a
+ * genuine provider shrink followed by genuine recovery. Polluted pins recover
+ * explicitly via seal/rollover; the recoverable state is surfaced in the pin
+ * provenance and logs.
+ *
+ * #1381: the snapshot carries two distinct quantities. `nativeWindowTokens` is
+ * the raw provider window owned by member configuration and is the only value
+ * a provider may inject as its native window; `capacity` is the effective
+ * usable capacity that carrier reports and the session pin constrain one-way.
+ * Codex reports `native * effective_context_window_percent`, so feeding the
+ * effective value back as native recursed (258400 → 245480 → 233206 → …).
  */
 
 import {
@@ -25,6 +36,7 @@ import {
 } from '../../../../../config/context-capacity.js';
 import { resolveEffectiveOpenCodeModel } from '../../../../../config/opencode-model.js';
 import { shouldTakeAction } from '../../../../../config/session-strategy.js';
+import { createModuleLogger } from '../../../../../infrastructure/logger.js';
 import type { ISessionSealer } from '../../session/SessionSealer.js';
 import type { ISessionChainStore } from '../../stores/ports/SessionChainStore.js';
 import {
@@ -47,6 +59,8 @@ const UNRESOLVED_CAPABILITY: AgentContextCapability = {
   reason: 'service did not declare a concrete context capability',
 };
 
+const log = createModuleLogger('invocation-capacity-snapshot');
+
 export interface InvocationCapacitySnapshot {
   readonly capacity: ResolvedContextCapacity;
   readonly capability: AgentContextCapability;
@@ -55,6 +69,23 @@ export interface InvocationCapacitySnapshot {
   /** Immutable resolver inputs captured at this invocation boundary. */
   readonly memberWindowTokens: number | null;
   readonly model: string | undefined;
+  /**
+   * #1381: raw/native provider window owned by member configuration (manual or
+   * catalog source), captured before any session pin or carrier report applies.
+   * This is the ONLY value a provider may inject as its native window; the
+   * effective/pinned `capacity.windowTokens` must never feed back as native.
+   * `null` means this invocation has no config-owned native window (capacity is
+   * report-derived or unresolved) and the provider must not inject one.
+   */
+  readonly nativeWindowTokens: number | null;
+  /**
+   * #1381: raw carrier-reported window applied during this invocation, before
+   * any resolver floor adjustment. Used to surface (never auto-expand) a
+   * session pin sitting below the currently reported capacity — that state may
+   * be pre-fix feedback-loop pollution, and recovery stays explicit via
+   * seal/rollover.
+   */
+  readonly lastReportedWindowTokens?: number;
 }
 
 export interface AuthoritativeContextUsage {
@@ -102,6 +133,15 @@ function snapshotWithCapacity(
  * cache. The current invocation may replace it with a smaller resolved value;
  * a larger value remains clamped until the old session is sealed and a new
  * active record is created.
+ *
+ * #1381 recovery semantics: a pin polluted by the pre-fix native/effective
+ * feedback loop is indistinguishable from a genuine provider shrink — in both
+ * cases a later carrier report can exceed the pin — so a larger report must
+ * NEVER auto-expand the pin (that would bypass the rollover gate). Recovery
+ * of polluted pins stays explicit: seal/roll over the session (#1313 manual
+ * seal), after which the fresh session adopts the reported capacity. When a
+ * fresh carrier report does exceed the pin, the state is surfaced observably
+ * (log + provenance) so the operator knows a seal will recover capacity.
  */
 export async function applyActiveSessionCapacityPin(options: {
   snapshot: InvocationCapacitySnapshot;
@@ -143,6 +183,26 @@ export async function applyActiveSessionCapacityPin(options: {
     return snapshotWithCapacity(snapshot, snapshot.capacity);
   }
 
+  // #1381: a fresh carrier report above the pin is observable evidence that the
+  // pin may have been polluted by the pre-fix feedback loop — but it is equally
+  // consistent with a genuine provider shrink followed by genuine recovery, so
+  // it must not auto-expand. Surface the recoverable state; expansion still
+  // requires an explicit seal/rollover.
+  const freshReport = snapshot.lastReportedWindowTokens;
+  const pinBelowCarrierReport = resolvedPin && freshReport != null && freshReport >= resolvedPin.windowTokens;
+  if (pinBelowCarrierReport) {
+    log.warn(
+      {
+        catId,
+        threadId,
+        sessionId: active.id,
+        pinnedTokens: existingPin.windowTokens,
+        freshReportTokens: freshReport,
+      },
+      'session capacity pin is below the carrier-reported window; if polluted by the pre-#1381 feedback loop, seal the session to recover (expansion requires rollover)',
+    );
+  }
+
   if (!isUsableCapacityPin(active.capacityPin)) {
     await sessionChainStore.update(active.id, { capacityPin: existingPin, updatedAt: Date.now() });
   }
@@ -150,7 +210,11 @@ export async function applyActiveSessionCapacityPin(options: {
     windowTokens: existingPin.windowTokens,
     inputCeilingTokens: existingPin.inputCeilingTokens,
     source: existingPin.source,
-    provenance: `${existingPin.provenance}; session-pinned (shrink allowed, expansion requires rollover)`,
+    provenance: `${existingPin.provenance}; session-pinned (shrink allowed, expansion requires rollover)${
+      pinBelowCarrierReport
+        ? `; carrier now reports ${freshReport.toLocaleString()} tokens — seal the session to recover if this pin was polluted`
+        : ''
+    }`,
     actionable: existingPin.actionable,
   });
 }
@@ -211,6 +275,10 @@ export function applyReportedWindowToInvocationSnapshot(options: {
   if (!snapshot.capability.reportsRuntimeWindow || reportedWindowSize == null) return snapshot;
   return {
     ...snapshot,
+    // #1381: keep the RAW report as provider evidence for polluted-pin
+    // observability; the resolver may floor-adjust the capacity, but the
+    // pin-below-report check keys on what the carrier actually reported.
+    lastReportedWindowTokens: reportedWindowSize,
     capacity: resolveContextCapacity({
       catId,
       memberWindowTokens: snapshot.memberWindowTokens,
@@ -278,6 +346,14 @@ export function resolveInvocationCapacitySnapshot(options: {
     ...(binding ? { binding } : {}),
     memberWindowTokens,
     model,
+    // #1381: only member configuration (manual/catalog) owns a native window.
+    // A report-derived or unresolved capacity has no raw value to inject —
+    // feeding the effective number back as Codex's native model_context_window
+    // is the recursive shrink this field exists to prevent.
+    nativeWindowTokens:
+      resolvedCapacity.source === 'manual' || resolvedCapacity.source === 'catalog'
+        ? resolvedCapacity.windowTokens
+        : null,
   };
 }
 
