@@ -129,7 +129,7 @@ export class DossierCapabilityProfileRevisionSource implements CapabilityProfile
           catId,
           reason: {
             code: CAPABILITY_PROFILE_INVALID_REASON,
-            summary: `Capability profile for ${catId} is invalid (${[...new Set(issues.map((issue) => issue.code))].join(', ')})`,
+            summary: `Capability profile for ${catId} has parse diagnostics (${[...new Set(issues.map((issue) => issue.code))].join(', ')})`,
             sourceRefs: issues.slice(0, 32).map((issue) => `docs/team/cat-dossier.md#L${issue.line}`),
           },
         },

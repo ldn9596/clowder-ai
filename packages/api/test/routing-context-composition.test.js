@@ -179,6 +179,14 @@ describe('F293 routing context composition', () => {
     await assertDegraded(runtime, 'model_missing', missingModelCatId);
   });
 
+  test('does not hide a missing model contract behind a tolerated syntax diagnostic', async (t) => {
+    const { runtime, projectRoot } = fixture(t, {
+      members: { [missingModelCatId]: catRegistry.getOrThrow(missingModelCatId).config },
+    });
+    writeDossier(projectRoot, profile(missingModelCatId).replace('oneLiner: "Local member"', 'handle: @local'));
+    await assertDegraded(runtime, 'model_missing', missingModelCatId);
+  });
+
   test('observes a locally created dossier after an initially absent profile without restarting', async (t) => {
     const { runtime, projectRoot } = fixture(t);
     const first = await runtime.readService.read({ ownerId, observedAt: Date.now() });
@@ -196,14 +204,6 @@ describe('F293 routing context composition', () => {
     ['missing identity', '', '```'],
     ['malformed identity', 'entityId: "unterminated', '```'],
     ['mismatched identity', `entityId: "cat:${primaryCatId}"`, '```'],
-    [
-      'invalid YAML flow sequence',
-      `entityId: "cat:${secondaryCatId}"\nroutingSignals:\n  peakCapabilities: ["reasoning"`,
-      '```',
-    ],
-    ['invalid YAML flow mapping', `entityId: "cat:${secondaryCatId}"\nprovenance: { version: "1"`, '```'],
-    ['invalid YAML quoted scalar', `entityId: "cat:${secondaryCatId}"\noneLiner: "unterminated`, '```'],
-    ['invalid YAML duplicate key', `entityId: "cat:${secondaryCatId}"\noneLiner: "first"\noneLiner: "second"`, '```'],
     ['unclosed block', `entityId: "cat:${secondaryCatId}"`, ''],
   ]) {
     test(`diagnoses ${label} beside a valid peer without hiding unavailable signals`, async (t) => {
@@ -249,6 +249,79 @@ describe('F293 routing context composition', () => {
       assert.equal(decision.targets[1].disposition, 'warned');
       assert.ok(decision.targets[1].reasons.some((reason) => reason.code === 'capability_profile_invalid'));
       assert.match(await runtime.promptProjection.resolve({ ownerId }), /capability_profile_invalid/);
+    });
+  }
+
+  for (const [label, fields] of [
+    ['unquoted Chinese colon', 'oneLiner: 深度推理: 系统设计'],
+    ['tab indentation', 'routingSignals:\n\tpeakCapabilities: ["reasoning"]'],
+    ['bare @ handle', 'handle: @secondary'],
+    ['unclosed flow sequence', 'routingSignals:\n  peakCapabilities: ["reasoning"'],
+    ['unclosed flow mapping', 'provenance: { version: "1"'],
+    ['unclosed quoted scalar', 'oneLiner: "unterminated'],
+    ['duplicate key', 'oneLiner: "first"\noneLiner: "second"'],
+  ]) {
+    test(`retains an applied profile and traceable ${label} diagnostic while unavailable still wins`, async (t) => {
+      const now = Date.now();
+      const primarySignal = {
+        v: 1,
+        ownerId,
+        eventId: 'primary-down',
+        commandId: 'mark-primary-down',
+        subjectRef: { type: 'cat', catId: primaryCatId },
+        reasonCode: 'provider_unreachable',
+        source: 'health_probe',
+        observedAt: now,
+        evidenceRef: 'test:health',
+        eventType: 'asserted',
+        state: 'unavailable',
+        validUntil: now + 60_000,
+      };
+      const signals = [primarySignal];
+      const { runtime, projectRoot } = fixture(t, { signals });
+      const tolerant = [
+        '```yaml',
+        `# structured-profile: cat:${secondaryCatId}`,
+        `entityId: "cat:${secondaryCatId}"`,
+        fields,
+        '```',
+      ].join('\n');
+      writeDossier(projectRoot, `${profile(primaryCatId)}\n${tolerant}\n`);
+      const read = await runtime.readService.read({ ownerId, observedAt: now });
+      assert.equal(read.resolution.state, 'fresh');
+      const secondary = read.resolution.snapshot.candidates.find((cat) => cat.binding.catId === secondaryCatId);
+      assert.equal(secondary.profile.state, 'applied');
+      assert.equal(secondary.availability, 'available');
+      assert.equal(secondary.effect, 'eligible');
+      const diagnostic = secondary.reasons.find((reason) => reason.code === 'capability_profile_invalid');
+      assert.ok(diagnostic);
+      assert.match(diagnostic.summary, /invalid_yaml/);
+      assert.ok(diagnostic.sourceRefs.some((ref) => /docs\/team\/cat-dossier\.md#L10$/.test(ref)));
+      const decision = await runtime.dispatchPreflight.preflight({
+        ownerId,
+        targetCatIds: [primaryCatId, secondaryCatId],
+      });
+      assert.equal(decision.targets[0].disposition, 'rejected');
+      assert.deepEqual(
+        decision.targets[0].alternatives.map((candidate) => candidate.catId),
+        [secondaryCatId],
+      );
+      assert.equal(decision.targets[1].disposition, 'warned');
+      assert.ok(decision.targets[1].reasons.some((reason) => reason.code === 'capability_profile_invalid'));
+      assert.match(await runtime.promptProjection.resolve({ ownerId }), /invalid_yaml/);
+
+      signals.push({
+        ...primarySignal,
+        eventId: 'secondary-down',
+        commandId: 'mark-secondary-down',
+        subjectRef: { type: 'cat', catId: secondaryCatId },
+      });
+      const unavailable = await runtime.dispatchPreflight.preflight({ ownerId, targetCatIds: [secondaryCatId] });
+      assert.equal(unavailable.resolverState, 'fresh');
+      assert.equal(unavailable.targets[0].disposition, 'rejected');
+      assert.ok(unavailable.targets[0].reasons.some((reason) => reason.code === 'routing_signal_unavailable'));
+      assert.ok(unavailable.targets[0].reasons.some((reason) => reason.code === 'capability_profile_invalid'));
+      assert.deepEqual(unavailable.targets[0].alternatives, []);
     });
   }
 
@@ -299,13 +372,20 @@ describe('F293 routing context composition', () => {
     );
   });
 
-  test('degrades globally when every marked record is syntactically invalid YAML', async (t) => {
+  test('keeps the only projected profile usable with a syntax diagnostic and excludes ordinary absence from alternatives', async (t) => {
     const { runtime, projectRoot } = fixture(t);
     writeDossier(
       projectRoot,
       profile(primaryCatId).replace('oneLiner: "Local member"', 'routingSignals:\n  peakCapabilities: ["reasoning"'),
     );
-    await assertDegraded(runtime, 'dossier_unreadable_or_empty');
+    const read = await runtime.readService.read({ ownerId, observedAt: Date.now() });
+    assert.equal(read.resolution.state, 'fresh');
+    assert.equal(read.resolution.snapshot.candidates[0].profile.state, 'applied');
+    assert.equal(read.resolution.snapshot.candidates[1].profile.state, 'absent');
+    const decision = await runtime.dispatchPreflight.preflight({ ownerId, targetCatIds: [primaryCatId] });
+    assert.equal(decision.targets[0].disposition, 'warned');
+    assert.match(decision.targets[0].reasons[0].summary, /invalid_yaml/);
+    assert.deepEqual(decision.targets[0].alternatives, []);
   });
 
   test('clears a syntax diagnostic after the same record is repaired', async (t) => {
@@ -318,7 +398,7 @@ describe('F293 routing context composition', () => {
     const input = { ownerId, observedAt: 10_000 };
     const first = await runtime.readService.read(input);
     assert.equal(first.resolution.state, 'fresh');
-    assert.equal(first.resolution.snapshot.candidates[1].profile.state, 'absent');
+    assert.equal(first.resolution.snapshot.candidates[1].profile.state, 'applied');
     assert.match(first.resolution.snapshot.candidates[1].reasons[0].summary, /invalid_yaml/);
     writeDossier(projectRoot, profile(primaryCatId) + malformed.replace('["reasoning"', '["reasoning"]'));
     const second = await runtime.readService.read(input);

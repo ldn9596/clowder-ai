@@ -26,12 +26,39 @@ describe('canonical dossier parse diagnostics', () => {
     ['flow mapping', 'provenance: { version: "1"'],
     ['quoted scalar', 'oneLiner: "unterminated'],
     ['duplicate key', 'oneLiner: "first"\noneLiner: "second"'],
-  ])('rejects invalid YAML %s even when the marked identity is valid', (_label, fields) => {
-    const markdown = `${good}\n\n\`\`\`yaml\n# structured-profile: cat:bad\nentityId: "cat:bad"\n${fields}\n\`\`\``;
+    ['unquoted Chinese colon', 'oneLiner: 深度推理: 系统设计'],
+    ['tab indentation', 'routingSignals:\n\tpeakCapabilities: ["reasoning"]'],
+    ['bare @ handle', 'handle: @bad'],
+  ])('diagnoses invalid YAML %s while retaining a valid identity projection', (_label, fields) => {
+    const markdown = `${good}\n\n\`\`\`yaml\n# structured-profile: cat:bad\nentityId: "cat:bad"\nl0RoutingNote: "Review with evidence"\n${fields}\n\`\`\``;
     const diagnostics: DossierParseDiagnostic[] = [];
     const profiles = parser.parseDossierProfiles(markdown, (diagnostic) => diagnostics.push(diagnostic));
-    expect([...profiles.keys()]).toEqual(['good']);
+    expect([...profiles.keys()]).toEqual(['good', 'bad']);
+    expect(profiles.get('bad')).toMatchObject({ entityId: 'cat:bad', l0RoutingNote: 'Review with evidence' });
     expect(diagnostics).toEqual([{ catId: 'bad', code: 'invalid_yaml', line: 7 }]);
+    expect(parser.parseDossierProfiles(markdown)).toEqual(profiles);
+  });
+
+  it.each([true, false])('keeps a repeated usable member with syntax diagnostics (valid first: %s)', (validFirst) => {
+    const tolerant = good.replace('entityId: "cat:good"', 'entityId: "cat:good"\nhandle: @good');
+    const blocks = validFirst ? [good, tolerant] : [tolerant, good];
+    const diagnostics: DossierParseDiagnostic[] = [];
+    const profiles = parser.parseDossierProfiles(blocks.join('\n\n'), (issue) => diagnostics.push(issue));
+    expect([...profiles.keys()]).toEqual(['good']);
+    expect(profiles.get('good')?.entityId).toBe('cat:good');
+    expect(diagnostics).toEqual([{ catId: 'good', code: 'invalid_yaml', line: validFirst ? 7 : 2 }]);
+  });
+
+  it.each([
+    true,
+    false,
+  ])('does not recover an invalid identity through a tolerant block (invalid first: %s)', (invalidFirst) => {
+    const tolerant = good.replaceAll('good', 'bad').replace('entityId: "cat:bad"', 'entityId: "cat:bad"\nhandle: @bad');
+    const blocks = invalidFirst ? [missingIdentity, tolerant] : [tolerant, missingIdentity];
+    const diagnostics: DossierParseDiagnostic[] = [];
+    const profiles = parser.parseDossierProfiles([good, ...blocks].join('\n\n'), (issue) => diagnostics.push(issue));
+    expect([...profiles.keys()]).toEqual(['good']);
+    expect(diagnostics.map((issue) => issue.code).sort()).toEqual(['invalid_identity', 'invalid_yaml']);
   });
 
   it('accepts literal brackets and backticks in valid quoted and block scalars', () => {
@@ -89,19 +116,28 @@ describe('canonical dossier parse diagnostics', () => {
     expect(diagnostics).toEqual([]);
   });
 
-  it('caches diagnostics with the canonical profiles and clears them when the file is repaired', () => {
+  it.each([
+    ['invalid identity', missingIdentity, 'invalid_identity', false],
+    [
+      'tolerated syntax',
+      good.replaceAll('good', 'bad').replace('entityId: "cat:bad"', 'entityId: "cat:bad"\nhandle: @bad'),
+      'invalid_yaml',
+      true,
+    ],
+  ])('caches %s diagnostics with the projected profiles and clears them on repair', (_label, block, code, usable) => {
     const root = mkdtempSync(join(tmpdir(), 'dossier-diagnostics-'));
     roots.push(root);
     const directory = join(root, 'docs', 'team');
     mkdirSync(directory, { recursive: true });
     const path = join(directory, 'cat-dossier.md');
-    writeFileSync(path, `${good}\n\n${missingIdentity}`);
+    writeFileSync(path, `${good}\n\n${block}`);
     const parse = vi.spyOn(parser, 'parseDossierProfiles');
     const first = loadDossierProfilesWithDiagnostics(root);
     const cached = loadDossierProfilesWithDiagnostics(root);
     expect(parse).toHaveBeenCalledTimes(1);
     expect(cached.profiles).toBe(first.profiles);
-    expect(cached.diagnostics).toEqual([{ catId: 'bad', code: 'invalid_identity', line: 7 }]);
+    expect(cached.diagnostics).toEqual([{ catId: 'bad', code, line: 7 }]);
+    expect(cached.profiles.has('bad')).toBe(usable);
     expect(loadDossierProfiles(root)).toBe(first.profiles);
     expect(parse).toHaveBeenCalledTimes(1);
     writeFileSync(path, `${good}\n\n${good.replaceAll('good', 'bad')}`);

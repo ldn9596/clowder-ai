@@ -10,7 +10,8 @@
  * Format: fenced ```yaml blocks with first line `# structured-profile: cat:<catId>`.
  * See docs/team/cat-dossier.md "Schema: 结构化投影层" for full spec.
  *
- * Validate syntax with the shared YAML dependency, then project the supported fields.
+ * Report syntax errors with the shared YAML dependency while preserving the tolerant
+ * projection of supported fields when the marked identity and block boundary are valid.
  */
 import { parseDocument } from 'yaml';
 
@@ -46,6 +47,7 @@ export interface DossierProfile {
 
 export interface DossierParseDiagnostic {
   catId: string;
+  /** Syntax errors are diagnostic only; identity or fence errors make the member unusable. */
   code: 'invalid_identity' | 'identity_mismatch' | 'unterminated_block' | 'invalid_yaml';
   /** One-based line of the structured-profile marker. */
   line: number;
@@ -76,10 +78,14 @@ export function parseDossierProfiles(
     const profile = parseYamlBlock(blockContent);
     const code = profileDiagnosticCode(profile, catId, Boolean(match[3]), validYaml);
     if (code) {
-      invalidCatIds.add(catId);
-      profiles.delete(catId);
       const markerOffset = match.index + match[0].indexOf(markerMatch[0]);
       reportDiagnostic?.({ catId, code, line: markdownContent.slice(0, markerOffset).split('\n').length });
+    }
+    // Strict YAML evidence must not revoke a profile the existing projection can recover.
+    // Identity/fence failures still invalidate every block for that member, in either order.
+    if (code && code !== 'invalid_yaml') {
+      invalidCatIds.add(catId);
+      profiles.delete(catId);
     } else if (profile && !invalidCatIds.has(catId)) {
       profiles.set(catId, profile);
     }
