@@ -22,6 +22,36 @@ afterEach(() => {
 
 describe('canonical dossier parse diagnostics', () => {
   it.each([
+    ['flow sequence', 'routingSignals:\n  peakCapabilities: ["reasoning"'],
+    ['flow mapping', 'provenance: { version: "1"'],
+    ['quoted scalar', 'oneLiner: "unterminated'],
+    ['duplicate key', 'oneLiner: "first"\noneLiner: "second"'],
+  ])('rejects invalid YAML %s even when the marked identity is valid', (_label, fields) => {
+    const markdown = `${good}\n\n\`\`\`yaml\n# structured-profile: cat:bad\nentityId: "cat:bad"\n${fields}\n\`\`\``;
+    const diagnostics: DossierParseDiagnostic[] = [];
+    const profiles = parser.parseDossierProfiles(markdown, (diagnostic) => diagnostics.push(diagnostic));
+    expect([...profiles.keys()]).toEqual(['good']);
+    expect(diagnostics).toEqual([{ catId: 'bad', code: 'invalid_yaml', line: 7 }]);
+  });
+
+  it('accepts literal brackets and backticks in valid quoted and block scalars', () => {
+    const markdown = good.replace(
+      'entityId: "cat:good"',
+      'entityId: "cat:good"\noneLiner: "Literal [ and { and ```"\nnotes: |\n  An unmatched [ is plain text here.\n  ```',
+    );
+    for (const indent of ['', '  ']) {
+      const diagnostics: DossierParseDiagnostic[] = [];
+      const indented = markdown
+        .split('\n')
+        .map((line) => indent + line)
+        .join('\n');
+      const profiles = parser.parseDossierProfiles(indented, (diagnostic) => diagnostics.push(diagnostic));
+      expect(profiles.get('good')?.oneLiner).toBe('Literal [ and { and ```');
+      expect(diagnostics).toEqual([]);
+    }
+  });
+
+  it.each([
     ['missing', '', 'invalid_identity'],
     ['malformed', 'entityId: "unterminated', 'invalid_identity'],
     ['nested', 'identity:\n  entityId: "cat:bad"', 'invalid_identity'],

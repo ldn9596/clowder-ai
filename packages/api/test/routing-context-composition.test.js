@@ -196,6 +196,14 @@ describe('F293 routing context composition', () => {
     ['missing identity', '', '```'],
     ['malformed identity', 'entityId: "unterminated', '```'],
     ['mismatched identity', `entityId: "cat:${primaryCatId}"`, '```'],
+    [
+      'invalid YAML flow sequence',
+      `entityId: "cat:${secondaryCatId}"\nroutingSignals:\n  peakCapabilities: ["reasoning"`,
+      '```',
+    ],
+    ['invalid YAML flow mapping', `entityId: "cat:${secondaryCatId}"\nprovenance: { version: "1"`, '```'],
+    ['invalid YAML quoted scalar', `entityId: "cat:${secondaryCatId}"\noneLiner: "unterminated`, '```'],
+    ['invalid YAML duplicate key', `entityId: "cat:${secondaryCatId}"\noneLiner: "first"\noneLiner: "second"`, '```'],
     ['unclosed block', `entityId: "cat:${secondaryCatId}"`, ''],
   ]) {
     test(`diagnoses ${label} beside a valid peer without hiding unavailable signals`, async (t) => {
@@ -289,5 +297,38 @@ describe('F293 routing context composition', () => {
       decision.targets[1].alternatives.map((candidate) => candidate.catId),
       [primaryCatId],
     );
+  });
+
+  test('degrades globally when every marked record is syntactically invalid YAML', async (t) => {
+    const { runtime, projectRoot } = fixture(t);
+    writeDossier(
+      projectRoot,
+      profile(primaryCatId).replace('oneLiner: "Local member"', 'routingSignals:\n  peakCapabilities: ["reasoning"'),
+    );
+    await assertDegraded(runtime, 'dossier_unreadable_or_empty');
+  });
+
+  test('clears a syntax diagnostic after the same record is repaired', async (t) => {
+    const { runtime, projectRoot } = fixture(t);
+    const malformed = profile(secondaryCatId).replace(
+      'oneLiner: "Local member"',
+      'routingSignals:\n  peakCapabilities: ["reasoning"',
+    );
+    writeDossier(projectRoot, profile(primaryCatId) + malformed);
+    const input = { ownerId, observedAt: 10_000 };
+    const first = await runtime.readService.read(input);
+    assert.equal(first.resolution.state, 'fresh');
+    assert.equal(first.resolution.snapshot.candidates[1].profile.state, 'absent');
+    assert.match(first.resolution.snapshot.candidates[1].reasons[0].summary, /invalid_yaml/);
+    writeDossier(projectRoot, profile(primaryCatId) + malformed.replace('["reasoning"', '["reasoning"]'));
+    const second = await runtime.readService.read(input);
+    assert.equal(second.resolution.state, 'fresh');
+    assert.equal(second.resolution.snapshot.candidates[1].profile.state, 'applied');
+    assert.ok(
+      second.resolution.snapshot.candidates[1].reasons.every((reason) => reason.code !== 'capability_profile_invalid'),
+    );
+    assert.notEqual(first.resolution.inputRevisionRef, second.resolution.inputRevisionRef);
+    const decision = await runtime.dispatchPreflight.preflight({ ownerId, targetCatIds: [secondaryCatId] });
+    assert.equal(decision.targets[0].disposition, 'allowed');
   });
 });

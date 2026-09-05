@@ -10,8 +10,9 @@
  * Format: fenced ```yaml blocks with first line `# structured-profile: cat:<catId>`.
  * See docs/team/cat-dossier.md "Schema: 结构化投影层" for full spec.
  *
- * No external YAML dependency — uses purpose-built parser for the known format.
+ * Validate syntax with the shared YAML dependency, then project the supported fields.
  */
+import { parseDocument } from 'yaml';
 
 export interface DossierEngagementPolicy {
   quota: 'weekly_subscription_scarce';
@@ -45,7 +46,7 @@ export interface DossierProfile {
 
 export interface DossierParseDiagnostic {
   catId: string;
-  code: 'invalid_identity' | 'identity_mismatch' | 'unterminated_block';
+  code: 'invalid_identity' | 'identity_mismatch' | 'unterminated_block' | 'invalid_yaml';
   /** One-based line of the structured-profile marker. */
   line: number;
 }
@@ -62,17 +63,18 @@ export function parseDossierProfiles(
   const invalidCatIds = new Set<string>();
   if (!markdownContent) return profiles;
 
-  // Extract fenced yaml blocks: ```yaml ... ```
-  const yamlBlockPattern = /```yaml\r?\n([\s\S]*?)(```|$)/g;
+  // Only a fence line at the opening indentation closes a block; inline backticks are YAML data.
+  const yamlBlockPattern = /^([ \t]*)```yaml\r?\n([\s\S]*?)(^\1```[ \t]*\r?$|(?![\s\S]))/gm;
   for (const match of markdownContent.matchAll(yamlBlockPattern)) {
-    const blockContent = match[1].trim();
+    const blockContent = match[2].trim();
     // Check for structured-profile marker
     const markerMatch = blockContent.match(/^# structured-profile:\s*cat:(.+)$/m);
     if (!markerMatch) continue;
 
     const catId = markerMatch[1].trim();
+    const validYaml = parseDocument(blockContent).errors.length === 0;
     const profile = parseYamlBlock(blockContent);
-    const code = profileDiagnosticCode(profile, catId, Boolean(match[2]));
+    const code = profileDiagnosticCode(profile, catId, Boolean(match[3]), validYaml);
     if (code) {
       invalidCatIds.add(catId);
       profiles.delete(catId);
@@ -90,10 +92,12 @@ function profileDiagnosticCode(
   profile: DossierProfile | null,
   catId: string,
   closed: boolean,
+  validYaml: boolean,
 ): DossierParseDiagnostic['code'] | undefined {
   if (!closed) return 'unterminated_block';
   if (!profile) return 'invalid_identity';
   if (profile.entityId !== `cat:${catId}`) return 'identity_mismatch';
+  if (!validYaml) return 'invalid_yaml';
   return undefined;
 }
 
@@ -232,7 +236,7 @@ function extractObjectBlock(content: string, field: string): string | undefined 
 function directChildIndent(content: string): number | undefined {
   const indents = content
     .split('\n')
-    .filter((line) => line.trim())
+    .filter((line) => line.trim() && !line.trimStart().startsWith('#'))
     .map((line) => line.length - line.trimStart().length);
   return indents.length > 0 ? Math.min(...indents) : undefined;
 }
