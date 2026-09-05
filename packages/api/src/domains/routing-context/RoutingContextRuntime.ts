@@ -52,7 +52,11 @@ export function createRoutingContextRuntime(options: CreateRoutingContextRuntime
   const resolver = new RoutingContextResolver({
     signalStore,
     preferenceStore,
-    profileRevisionSource: new DossierCapabilityProfileRevisionSource({ projectRoot: options.projectRoot }),
+    // Dossiers are installation-owned state and may not have been created yet.
+    profileRevisionSource: new DossierCapabilityProfileRevisionSource({
+      projectRoot: options.projectRoot,
+      dossierMode: 'optional',
+    }),
   });
   const readService = new RoutingContextReadService({ catalogSource, resolver });
   const promptProjector = new RoutingContextPromptProjector();

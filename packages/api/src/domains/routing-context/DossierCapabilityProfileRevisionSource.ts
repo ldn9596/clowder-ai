@@ -69,7 +69,8 @@ export class DossierCapabilityProfileRevisionSource implements CapabilityProfile
       return { status: 'fresh', profiles: [], absentCatIds: candidateIds };
     }
 
-    if (profilesByCat.size === 0 && this.dossierMode === 'required' && candidateIds.length > 0) {
+    // Optional means the file may be absent, not that an existing broken file is healthy.
+    if (profilesByCat.size === 0 && candidateIds.length > 0) {
       return {
         status: 'degraded',
         reason: 'dossier_unreadable_or_empty',
