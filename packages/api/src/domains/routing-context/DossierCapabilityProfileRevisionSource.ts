@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto';
 import { capabilityProfileRevisionRefV1Schema, catRegistry } from '@cat-cafe/shared';
-import { type DossierProfile, isDossierAvailable, loadDossierProfiles } from '@cat-cafe/shared/dossier';
-import type {
-  CapabilityPendingProposalReader,
-  CapabilityProfileRevisionLoadInput,
-  CapabilityProfileRevisionLoadResult,
-  CapabilityProfileRevisionSource,
+import { type DossierProfile, loadDossierProfilesWithDiagnostics } from '@cat-cafe/shared/dossier';
+import {
+  CAPABILITY_PROFILE_INVALID_REASON,
+  type CapabilityPendingProposalReader,
+  type CapabilityProfileRevisionLoadInput,
+  type CapabilityProfileRevisionLoadResult,
+  type CapabilityProfileRevisionSource,
 } from './CapabilityProfileRevisionSource.js';
 
 interface DossierCapabilityProfileRevisionSourceOptions {
@@ -58,11 +59,11 @@ export class DossierCapabilityProfileRevisionSource implements CapabilityProfile
   }
 
   async load(input: CapabilityProfileRevisionLoadInput): Promise<CapabilityProfileRevisionLoadResult> {
-    const profilesByCat = loadDossierProfiles(this.projectRoot);
-    const dossierAvailable = isDossierAvailable(this.projectRoot);
+    const dossier = loadDossierProfilesWithDiagnostics(this.projectRoot);
+    const profilesByCat = dossier.profiles;
     const candidateIds = affectedCandidates(input);
 
-    if (!dossierAvailable) {
+    if (!dossier.available) {
       if (this.dossierMode === 'required') {
         return { status: 'degraded', reason: 'dossier_unavailable', affectedCatIds: candidateIds };
       }
@@ -120,6 +121,25 @@ export class DossierCapabilityProfileRevisionSource implements CapabilityProfile
       }),
     );
 
-    return { status: 'fresh', profiles: appliedProfiles, absentCatIds };
+    const diagnostics = candidateIds.flatMap((catId) => {
+      const issues = dossier.diagnostics.filter((diagnostic) => diagnostic.catId === catId);
+      if (issues.length === 0) return [];
+      return [
+        {
+          catId,
+          reason: {
+            code: CAPABILITY_PROFILE_INVALID_REASON,
+            summary: `Capability profile for ${catId} is invalid (${[...new Set(issues.map((issue) => issue.code))].join(', ')})`,
+            sourceRefs: issues.slice(0, 32).map((issue) => `docs/team/cat-dossier.md#L${issue.line}`),
+          },
+        },
+      ];
+    });
+    return {
+      status: 'fresh',
+      profiles: appliedProfiles,
+      absentCatIds,
+      ...(diagnostics.length > 0 ? { diagnostics } : {}),
+    };
   }
 }

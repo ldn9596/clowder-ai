@@ -191,4 +191,103 @@ describe('F293 routing context composition', () => {
     assert.equal(second.resolution.snapshot.candidates[0].profile.revision.modelId, 'test-model');
     assert.equal(second.resolution.snapshot.candidates[1].profile.state, 'absent');
   });
+
+  for (const [label, identity, closingFence] of [
+    ['missing identity', '', '```'],
+    ['malformed identity', 'entityId: "unterminated', '```'],
+    ['mismatched identity', `entityId: "cat:${primaryCatId}"`, '```'],
+    ['unclosed block', `entityId: "cat:${secondaryCatId}"`, ''],
+  ]) {
+    test(`diagnoses ${label} beside a valid peer without hiding unavailable signals`, async (t) => {
+      const now = Date.now();
+      const { runtime, projectRoot } = fixture(t, {
+        signals: [
+          {
+            v: 1,
+            ownerId,
+            eventId: 'primary-down',
+            commandId: 'mark-primary-down',
+            subjectRef: { type: 'cat', catId: primaryCatId },
+            reasonCode: 'provider_unreachable',
+            source: 'health_probe',
+            observedAt: now,
+            evidenceRef: 'test:health',
+            eventType: 'asserted',
+            state: 'unavailable',
+            validUntil: now + 60_000,
+          },
+        ],
+      });
+      const malformed = ['```yaml', `# structured-profile: cat:${secondaryCatId}`, identity, closingFence].join('\n');
+      writeDossier(projectRoot, `${profile(primaryCatId)}\n${malformed}\n`);
+      const read = await runtime.readService.read({ ownerId, observedAt: now });
+      assert.equal(read.resolution.state, 'fresh');
+      const primary = read.resolution.snapshot.candidates.find((cat) => cat.binding.catId === primaryCatId);
+      const secondary = read.resolution.snapshot.candidates.find((cat) => cat.binding.catId === secondaryCatId);
+      assert.equal(primary.profile.state, 'applied');
+      const diagnostic = secondary.reasons.find((reason) => reason.code === 'capability_profile_invalid');
+      assert.ok(diagnostic, 'marked malformed records must not silently become ordinary absence');
+      assert.ok(diagnostic.sourceRefs.some((ref) => /docs\/team\/cat-dossier\.md#L\d+/.test(ref)));
+      assert.equal(secondary.profile.state, 'absent');
+      assert.equal(secondary.effect, 'eligible', 'availability effect retains its existing signal-only contract');
+      assert.equal(secondary.availability, 'available', 'profile errors do not invent provider outages');
+      const decision = await runtime.dispatchPreflight.preflight({
+        ownerId,
+        targetCatIds: [primaryCatId, secondaryCatId],
+      });
+      assert.equal(decision.resolverState, 'fresh');
+      assert.equal(decision.targets[0].disposition, 'rejected');
+      assert.deepEqual(decision.targets[0].alternatives, []);
+      assert.equal(decision.targets[1].disposition, 'warned');
+      assert.ok(decision.targets[1].reasons.some((reason) => reason.code === 'capability_profile_invalid'));
+      assert.match(await runtime.promptProjection.resolve({ ownerId }), /capability_profile_invalid/);
+    });
+  }
+
+  test('clears a removed malformed record diagnostic and refreshes its source revision', async (t) => {
+    const { runtime, projectRoot } = fixture(t);
+    writeDossier(
+      projectRoot,
+      `${profile(primaryCatId)}\n\`\`\`yaml\n# structured-profile: cat:${secondaryCatId}\n\`\`\`\n`,
+    );
+    const input = { ownerId, observedAt: 10_000 };
+    const first = await runtime.readService.read(input);
+    assert.equal(first.resolution.state, 'fresh');
+    assert.ok(
+      first.resolution.snapshot.candidates[1].reasons.some((reason) => reason.code === 'capability_profile_invalid'),
+    );
+    writeDossier(projectRoot, profile(primaryCatId));
+    const second = await runtime.readService.read(input);
+    assert.equal(second.resolution.state, 'fresh');
+    assert.equal(second.resolution.snapshot.candidates[1].profile.state, 'absent');
+    assert.deepEqual(second.resolution.snapshot.candidates[1].reasons, []);
+    assert.notEqual(first.resolution.inputRevisionRef, second.resolution.inputRevisionRef);
+    const decision = await runtime.dispatchPreflight.preflight({ ownerId, targetCatIds: [secondaryCatId] });
+    assert.equal(decision.targets[0].disposition, 'allowed');
+  });
+
+  test('bounds repeated malformed-record diagnostics without degrading valid peers', async (t) => {
+    const { runtime, projectRoot } = fixture(t);
+    const badBlock = `\`\`\`yaml\n# structured-profile: cat:${secondaryCatId}\n\`\`\`\n`;
+    writeDossier(projectRoot, profile(primaryCatId) + badBlock.repeat(40));
+    const read = await runtime.readService.read({ ownerId, observedAt: Date.now() });
+    assert.equal(read.resolution.state, 'fresh');
+    assert.equal(read.resolution.snapshot.candidates[0].profile.state, 'applied');
+    const reasons = read.resolution.snapshot.candidates[1].reasons;
+    assert.equal(reasons.length, 1);
+    assert.equal(reasons[0].code, 'capability_profile_invalid');
+    assert.ok(reasons[0].sourceRefs.length > 0 && reasons[0].sourceRefs.length <= 32);
+    const decision = await runtime.dispatchPreflight.preflight({
+      ownerId,
+      targetCatIds: [primaryCatId, secondaryCatId],
+    });
+    assert.deepEqual(
+      decision.targets.map((target) => target.disposition),
+      ['allowed', 'warned'],
+    );
+    assert.deepEqual(
+      decision.targets[1].alternatives.map((candidate) => candidate.catId),
+      [primaryCatId],
+    );
+  });
 });

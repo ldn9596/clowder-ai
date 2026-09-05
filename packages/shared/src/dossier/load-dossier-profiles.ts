@@ -16,12 +16,13 @@
  */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import type { DossierProfile } from './parse-dossier-profiles.js';
+import type { DossierParseDiagnostic, DossierProfile } from './parse-dossier-profiles.js';
 import { parseDossierProfiles } from './parse-dossier-profiles.js';
 
 const DOSSIER_RELATIVE_PATH = 'docs/team/cat-dossier.md';
 
 let _cachedProfiles: Map<string, DossierProfile> | null = null;
+let _cachedDiagnostics: DossierParseDiagnostic[] = [];
 let _cachedProjectRoot: string | null = null;
 let _cachedContent: string | null = null;
 /** Whether the dossier file was found and loaded (vs ENOENT / community scenario). */
@@ -39,12 +40,15 @@ export function loadDossierProfiles(projectRoot: string): Map<string, DossierPro
       _dossierFileFound = true;
       return _cachedProfiles;
     }
-    _cachedProfiles = parseDossierProfiles(content);
+    const diagnostics: DossierParseDiagnostic[] = [];
+    _cachedProfiles = parseDossierProfiles(content, (diagnostic) => diagnostics.push(diagnostic));
+    _cachedDiagnostics = diagnostics;
     _cachedContent = content;
     _dossierFileFound = true;
   } catch (err: unknown) {
     const isNotFound = (err as NodeJS.ErrnoException).code === 'ENOENT';
     _cachedProfiles = new Map();
+    _cachedDiagnostics = [];
     _cachedContent = null;
     if (isNotFound) {
       // Community scenario — no dossier file. Silent fallback OK per KD-9.
@@ -58,6 +62,16 @@ export function loadDossierProfiles(projectRoot: string): Map<string, DossierPro
   }
   _cachedProjectRoot = projectRoot;
   return _cachedProfiles;
+}
+
+/** Return profile data and its diagnostics from the same canonical read/parse. */
+export function loadDossierProfilesWithDiagnostics(projectRoot: string): {
+  profiles: Map<string, DossierProfile>;
+  diagnostics: readonly DossierParseDiagnostic[];
+  available: boolean;
+} {
+  const profiles = loadDossierProfiles(projectRoot);
+  return { profiles, diagnostics: _cachedDiagnostics, available: _dossierFileFound };
 }
 
 /**
@@ -124,6 +138,7 @@ export function hasDossierEntry(catId: string, projectRoot: string): boolean {
 /** Reset the cache (for testing). */
 export function _resetDossierCache(): void {
   _cachedProfiles = null;
+  _cachedDiagnostics = [];
   _cachedProjectRoot = null;
   _cachedContent = null;
   _dossierFileFound = false;

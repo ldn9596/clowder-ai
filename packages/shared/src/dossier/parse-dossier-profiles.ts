@@ -43,19 +43,28 @@ export interface DossierProfile {
   };
 }
 
+export interface DossierParseDiagnostic {
+  catId: string;
+  code: 'invalid_identity' | 'identity_mismatch' | 'unterminated_block';
+  /** One-based line of the structured-profile marker. */
+  line: number;
+}
+
 /**
  * Parse structured profile YAML blocks from dossier markdown content.
  * Returns a Map keyed by catId (e.g. "opus", "codex", "opus-47").
  */
-export function parseDossierProfiles(markdownContent: string): Map<string, DossierProfile> {
+export function parseDossierProfiles(
+  markdownContent: string,
+  reportDiagnostic?: (diagnostic: DossierParseDiagnostic) => void,
+): Map<string, DossierProfile> {
   const profiles = new Map<string, DossierProfile>();
+  const invalidCatIds = new Set<string>();
   if (!markdownContent) return profiles;
 
   // Extract fenced yaml blocks: ```yaml ... ```
-  const yamlBlockPattern = /```yaml\n([\s\S]*?)```/g;
-  let match: RegExpExecArray | null;
-
-  while ((match = yamlBlockPattern.exec(markdownContent)) !== null) {
+  const yamlBlockPattern = /```yaml\r?\n([\s\S]*?)(```|$)/g;
+  for (const match of markdownContent.matchAll(yamlBlockPattern)) {
     const blockContent = match[1].trim();
     // Check for structured-profile marker
     const markerMatch = blockContent.match(/^# structured-profile:\s*cat:(.+)$/m);
@@ -63,7 +72,13 @@ export function parseDossierProfiles(markdownContent: string): Map<string, Dossi
 
     const catId = markerMatch[1].trim();
     const profile = parseYamlBlock(blockContent);
-    if (profile) {
+    const code = profileDiagnosticCode(profile, catId, Boolean(match[2]));
+    if (code) {
+      invalidCatIds.add(catId);
+      profiles.delete(catId);
+      const markerOffset = match.index + match[0].indexOf(markerMatch[0]);
+      reportDiagnostic?.({ catId, code, line: markdownContent.slice(0, markerOffset).split('\n').length });
+    } else if (profile && !invalidCatIds.has(catId)) {
       profiles.set(catId, profile);
     }
   }
@@ -71,12 +86,23 @@ export function parseDossierProfiles(markdownContent: string): Map<string, Dossi
   return profiles;
 }
 
+function profileDiagnosticCode(
+  profile: DossierProfile | null,
+  catId: string,
+  closed: boolean,
+): DossierParseDiagnostic['code'] | undefined {
+  if (!closed) return 'unterminated_block';
+  if (!profile) return 'invalid_identity';
+  if (profile.entityId !== `cat:${catId}`) return 'identity_mismatch';
+  return undefined;
+}
+
 /**
  * Parse a single structured-profile YAML block into a DossierProfile.
  * Handles the well-defined format: flat key-value pairs + nested lists.
  */
 function parseYamlBlock(content: string): DossierProfile | null {
-  const entityId = extractStringField(content, 'entityId');
+  const entityId = extractDirectStringField(content, 'entityId');
   if (!entityId) return null;
 
   const profile: DossierProfile = { entityId };
