@@ -10,10 +10,17 @@
  * Format: fenced ```yaml blocks with first line `# structured-profile: cat:<catId>`.
  * See docs/team/cat-dossier.md "Schema: 结构化投影层" for full spec.
  *
- * Report syntax errors with the shared YAML dependency while preserving the tolerant
- * projection of supported fields when the marked identity and block boundary are valid.
+ * The existing field projection stays tolerant for roster consumers. Routing
+ * also consumes syntax/identity diagnostics from the same block traversal.
  */
 import { parseDocument } from 'yaml';
+
+export interface DossierProfileDiagnostic {
+  catId: string;
+  reason: 'invalid_yaml' | 'unclosed_block' | 'invalid_identity' | 'duplicate_profile';
+  /** One-based line of the structured-profile marker. */
+  line: number;
+}
 
 export interface DossierEngagementPolicy {
   quota: 'weekly_subscription_scarce';
@@ -45,25 +52,20 @@ export interface DossierProfile {
   };
 }
 
-export interface DossierParseDiagnostic {
-  catId: string;
-  /** Syntax errors are diagnostic only; identity or fence errors make the member unusable. */
-  code: 'invalid_identity' | 'identity_mismatch' | 'unterminated_block' | 'invalid_yaml';
-  /** One-based line of the structured-profile marker. */
-  line: number;
-}
-
 /**
  * Parse structured profile YAML blocks from dossier markdown content.
  * Returns a Map keyed by catId (e.g. "opus", "codex", "opus-47").
  */
-export function parseDossierProfiles(
-  markdownContent: string,
-  reportDiagnostic?: (diagnostic: DossierParseDiagnostic) => void,
-): Map<string, DossierProfile> {
+export function parseDossierProfiles(markdownContent: string): Map<string, DossierProfile> {
+  return parseDossierProfilesWithDiagnostics(markdownContent).profiles;
+}
+
+export function parseDossierProfilesWithDiagnostics(markdownContent: string): {
+  profiles: Map<string, DossierProfile>;
+  diagnostics: DossierProfileDiagnostic[];
+} {
   const profiles = new Map<string, DossierProfile>();
-  const invalidCatIds = new Set<string>();
-  if (!markdownContent) return profiles;
+  const diagnostics: DossierProfileDiagnostic[] = [];
 
   // Only a fence line at the opening indentation closes a block; inline backticks are YAML data.
   const yamlBlockPattern = /^([ \t]*)```yaml\r?\n([\s\S]*?)(^\1```[ \t]*\r?$|(?![\s\S]))/gm;
@@ -74,37 +76,28 @@ export function parseDossierProfiles(
     if (!markerMatch) continue;
 
     const catId = markerMatch[1].trim();
-    const validYaml = parseDocument(blockContent).errors.length === 0;
-    const profile = parseYamlBlock(blockContent);
-    const code = profileDiagnosticCode(profile, catId, Boolean(match[3]), validYaml);
-    if (code) {
-      const markerOffset = match.index + match[0].indexOf(markerMatch[0]);
-      reportDiagnostic?.({ catId, code, line: markdownContent.slice(0, markerOffset).split('\n').length });
+    const markerOffset = match.index + match[0].indexOf(markerMatch[0]);
+    const line = markdownContent.slice(0, markerOffset).split('\n').length;
+    if (!match[3]) {
+      diagnostics.push({ catId, reason: 'unclosed_block', line });
+      continue;
     }
-    // Strict YAML evidence must not revoke a profile the existing projection can recover.
-    // Identity/fence failures still invalidate every block for that member, in either order.
-    if (code && code !== 'invalid_yaml') {
-      invalidCatIds.add(catId);
-      profiles.delete(catId);
-    } else if (profile && !invalidCatIds.has(catId)) {
+    if (parseDocument(blockContent).errors.length > 0) {
+      diagnostics.push({ catId, reason: 'invalid_yaml', line });
+    }
+    const profile = parseYamlBlock(blockContent);
+    // Routing requires a matching direct identity even when the roster projection recovers nested fields.
+    const directIdentity = extractDirectStringField(blockContent, 'entityId');
+    if (!profile || profile.entityId !== `cat:${catId}` || directIdentity !== `cat:${catId}`) {
+      diagnostics.push({ catId, reason: 'invalid_identity', line });
+    }
+    if (profile) {
+      if (profiles.has(catId)) diagnostics.push({ catId, reason: 'duplicate_profile', line });
       profiles.set(catId, profile);
     }
   }
 
-  return profiles;
-}
-
-function profileDiagnosticCode(
-  profile: DossierProfile | null,
-  catId: string,
-  closed: boolean,
-  validYaml: boolean,
-): DossierParseDiagnostic['code'] | undefined {
-  if (!closed) return 'unterminated_block';
-  if (!profile) return 'invalid_identity';
-  if (profile.entityId !== `cat:${catId}`) return 'identity_mismatch';
-  if (!validYaml) return 'invalid_yaml';
-  return undefined;
+  return { profiles, diagnostics };
 }
 
 /**
@@ -112,7 +105,7 @@ function profileDiagnosticCode(
  * Handles the well-defined format: flat key-value pairs + nested lists.
  */
 function parseYamlBlock(content: string): DossierProfile | null {
-  const entityId = extractDirectStringField(content, 'entityId');
+  const entityId = extractStringField(content, 'entityId');
   if (!entityId) return null;
 
   const profile: DossierProfile = { entityId };

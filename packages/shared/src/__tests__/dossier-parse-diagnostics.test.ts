@@ -2,12 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import {
-  _resetDossierCache,
-  loadDossierProfiles,
-  loadDossierProfilesWithDiagnostics,
-} from '../dossier/load-dossier-profiles.js';
-import type { DossierParseDiagnostic } from '../dossier/parse-dossier-profiles.js';
+import { _resetDossierCache, loadDossierProfiles, loadDossierSnapshot } from '../dossier/load-dossier-profiles.js';
 import * as parser from '../dossier/parse-dossier-profiles.js';
 
 const good = ['```yaml', '# structured-profile: cat:good', 'entityId: "cat:good"', '```'].join('\n');
@@ -30,36 +25,55 @@ describe('canonical dossier parse diagnostics', () => {
     ['tab indentation', 'routingSignals:\n\tpeakCapabilities: ["reasoning"]'],
     ['bare @ handle', 'handle: @bad'],
   ])('diagnoses invalid YAML %s while retaining a valid identity projection', (_label, fields) => {
-    const markdown = `${good}\n\n\`\`\`yaml\n# structured-profile: cat:bad\nentityId: "cat:bad"\nl0RoutingNote: "Review with evidence"\n${fields}\n\`\`\``;
-    const diagnostics: DossierParseDiagnostic[] = [];
-    const profiles = parser.parseDossierProfiles(markdown, (diagnostic) => diagnostics.push(diagnostic));
+    const markdown = [
+      good,
+      '',
+      '```yaml',
+      '# structured-profile: cat:bad',
+      'entityId: "cat:bad"',
+      'l0RoutingNote: "Review with evidence"',
+      fields,
+      '```',
+    ].join('\n');
+    const { profiles, diagnostics } = parser.parseDossierProfilesWithDiagnostics(markdown);
     expect([...profiles.keys()]).toEqual(['good', 'bad']);
     expect(profiles.get('bad')).toMatchObject({ entityId: 'cat:bad', l0RoutingNote: 'Review with evidence' });
-    expect(diagnostics).toEqual([{ catId: 'bad', code: 'invalid_yaml', line: 7 }]);
+    expect(diagnostics).toEqual([{ catId: 'bad', reason: 'invalid_yaml', line: 7 }]);
     expect(parser.parseDossierProfiles(markdown)).toEqual(profiles);
   });
 
-  it.each([true, false])('keeps a repeated usable member with syntax diagnostics (valid first: %s)', (validFirst) => {
+  it.each([true, false])('keeps repeated usable profiles and both diagnostics (valid first: %s)', (validFirst) => {
     const tolerant = good.replace('entityId: "cat:good"', 'entityId: "cat:good"\nhandle: @good');
     const blocks = validFirst ? [good, tolerant] : [tolerant, good];
-    const diagnostics: DossierParseDiagnostic[] = [];
-    const profiles = parser.parseDossierProfiles(blocks.join('\n\n'), (issue) => diagnostics.push(issue));
+    const { profiles, diagnostics } = parser.parseDossierProfilesWithDiagnostics(blocks.join('\n\n'));
     expect([...profiles.keys()]).toEqual(['good']);
-    expect(profiles.get('good')?.entityId).toBe('cat:good');
-    expect(diagnostics).toEqual([{ catId: 'good', code: 'invalid_yaml', line: validFirst ? 7 : 2 }]);
+    expect(diagnostics).toEqual([
+      { catId: 'good', reason: 'invalid_yaml', line: validFirst ? 7 : 2 },
+      { catId: 'good', reason: 'duplicate_profile', line: validFirst ? 7 : 8 },
+    ]);
   });
 
-  it.each([
-    true,
-    false,
-  ])('does not recover an invalid identity through a tolerant block (invalid first: %s)', (invalidFirst) => {
-    const tolerant = good.replaceAll('good', 'bad').replace('entityId: "cat:bad"', 'entityId: "cat:bad"\nhandle: @bad');
-    const blocks = invalidFirst ? [missingIdentity, tolerant] : [tolerant, missingIdentity];
-    const diagnostics: DossierParseDiagnostic[] = [];
-    const profiles = parser.parseDossierProfiles([good, ...blocks].join('\n\n'), (issue) => diagnostics.push(issue));
-    expect([...profiles.keys()]).toEqual(['good']);
-    expect(diagnostics.map((issue) => issue.code).sort()).toEqual(['invalid_identity', 'invalid_yaml']);
-  });
+  for (const tolerant of [false, true]) {
+    it.each([
+      true,
+      false,
+    ])(`retains fatal evidence without deleting the roster projection (tolerant: ${tolerant}, invalid first: %s)`, (invalidFirst) => {
+      const validBad = good.replaceAll('good', 'bad');
+      const projected = tolerant
+        ? validBad.replace('entityId: "cat:bad"', 'entityId: "cat:bad"\nhandle: @bad')
+        : validBad;
+      const blocks = invalidFirst ? [missingIdentity, projected] : [projected, missingIdentity];
+      const { profiles, diagnostics } = parser.parseDossierProfilesWithDiagnostics([good, ...blocks].join('\n\n'));
+      expect([...profiles.keys()]).toEqual(['good', 'bad']);
+      expect(profiles.get('bad')?.entityId).toBe('cat:bad');
+      expect(diagnostics).toContainEqual({
+        catId: 'bad',
+        reason: 'invalid_identity',
+        line: invalidFirst ? 7 : tolerant ? 13 : 12,
+      });
+      expect(parser.parseDossierProfiles([good, ...blocks].join('\n\n'))).toEqual(profiles);
+    });
+  }
 
   it('accepts literal brackets and backticks in valid quoted and block scalars', () => {
     const markdown = good.replace(
@@ -67,52 +81,43 @@ describe('canonical dossier parse diagnostics', () => {
       'entityId: "cat:good"\noneLiner: "Literal [ and { and ```"\nnotes: |\n  An unmatched [ is plain text here.\n  ```',
     );
     for (const indent of ['', '  ']) {
-      const diagnostics: DossierParseDiagnostic[] = [];
       const indented = markdown
         .split('\n')
         .map((line) => indent + line)
         .join('\n');
-      const profiles = parser.parseDossierProfiles(indented, (diagnostic) => diagnostics.push(diagnostic));
+      const { profiles, diagnostics } = parser.parseDossierProfilesWithDiagnostics(indented);
       expect(profiles.get('good')?.oneLiner).toBe('Literal [ and { and ```');
       expect(diagnostics).toEqual([]);
     }
   });
 
   it.each([
-    ['missing', '', 'invalid_identity'],
-    ['malformed', 'entityId: "unterminated', 'invalid_identity'],
-    ['nested', 'identity:\n  entityId: "cat:bad"', 'invalid_identity'],
-    ['wrong member', 'entityId: "cat:good"', 'identity_mismatch'],
-  ])('reports a %s identity with its marker line while retaining a valid peer', (_label, identity, code) => {
-    const markdown = `${good}\n\n\`\`\`yaml\n# structured-profile: cat:bad\n${identity}\n\`\`\``;
-    const diagnostics: DossierParseDiagnostic[] = [];
-    const profiles = parser.parseDossierProfiles(markdown, (diagnostic) => diagnostics.push(diagnostic));
-    expect([...profiles.keys()]).toEqual(['good']);
-    expect(diagnostics).toEqual([{ catId: 'bad', code, line: 7 }]);
-    expect([...parser.parseDossierProfiles(markdown).keys()]).toEqual(['good']);
+    ['missing', '', false],
+    ['malformed', 'entityId: "unterminated', false],
+    ['nested', 'identity:\n  entityId: "cat:bad"', true],
+    ['wrong member', 'entityId: "cat:good"', true],
+  ])('reports a %s direct identity for routing while preserving the roster projection', (_label, identity, projected) => {
+    const markdown = [good, '', '```yaml', '# structured-profile: cat:bad', identity, '```'].join('\n');
+    const { profiles, diagnostics } = parser.parseDossierProfilesWithDiagnostics(markdown);
+    expect(profiles.has('bad')).toBe(projected);
+    expect(diagnostics).toContainEqual({ catId: 'bad', reason: 'invalid_identity', line: 7 });
+    expect(parser.parseDossierProfiles(markdown)).toEqual(profiles);
   });
 
-  it('reports an unterminated marked block from the same traversal', () => {
-    const diagnostics: DossierParseDiagnostic[] = [];
-    const markdown = `${good}\n\n\`\`\`yaml\n# structured-profile: cat:bad\nentityId: "cat:bad"`;
-    expect([...parser.parseDossierProfiles(markdown, (issue) => diagnostics.push(issue)).keys()]).toEqual(['good']);
-    expect(diagnostics).toEqual([{ catId: 'bad', code: 'unterminated_block', line: 7 }]);
-  });
-
-  it.each([true, false])('never resurrects a malformed member from another block (valid first: %s)', (validFirst) => {
-    const validBad = good.replaceAll('good', 'bad');
-    const blocks = validFirst ? [validBad, missingIdentity] : [missingIdentity, validBad];
-    const diagnostics: DossierParseDiagnostic[] = [];
-    const profiles = parser.parseDossierProfiles([good, ...blocks].join('\n\n'), (issue) => diagnostics.push(issue));
+  it.each([
+    '',
+    '\noneLiner: "Literal ``` data"',
+  ])('reports an unterminated marked block despite inline data %s', (fields) => {
+    const markdown = [good, '', '```yaml', '# structured-profile: cat:bad', `entityId: "cat:bad"${fields}`].join('\n');
+    const { profiles, diagnostics } = parser.parseDossierProfilesWithDiagnostics(markdown);
     expect([...profiles.keys()]).toEqual(['good']);
-    expect(diagnostics).toHaveLength(1);
-    expect(diagnostics[0].catId).toBe('bad');
+    expect(diagnostics).toEqual([{ catId: 'bad', reason: 'unclosed_block', line: 7 }]);
   });
 
   it('ignores ordinary unmarked YAML and accepts valid CRLF profiles without diagnostics', () => {
-    const diagnostics: DossierParseDiagnostic[] = [];
-    const markdown = `\`\`\`yaml\nunrelated: "unterminated\n\`\`\`\n${good}`.replaceAll('\n', '\r\n');
-    expect([...parser.parseDossierProfiles(markdown, (issue) => diagnostics.push(issue)).keys()]).toEqual(['good']);
+    const markdown = ['```yaml', 'unrelated: "unterminated', '```', good].join('\n').replaceAll('\n', '\r\n');
+    const { profiles, diagnostics } = parser.parseDossierProfilesWithDiagnostics(markdown);
+    expect([...profiles.keys()]).toEqual(['good']);
     expect(diagnostics).toEqual([]);
   });
 
@@ -124,27 +129,29 @@ describe('canonical dossier parse diagnostics', () => {
       'invalid_yaml',
       true,
     ],
-  ])('caches %s diagnostics with the projected profiles and clears them on repair', (_label, block, code, usable) => {
+  ])('caches %s diagnostics with the projected profiles and clears them on repair', (_label, block, reason, projected) => {
     const root = mkdtempSync(join(tmpdir(), 'dossier-diagnostics-'));
     roots.push(root);
     const directory = join(root, 'docs', 'team');
     mkdirSync(directory, { recursive: true });
     const path = join(directory, 'cat-dossier.md');
     writeFileSync(path, `${good}\n\n${block}`);
-    const parse = vi.spyOn(parser, 'parseDossierProfiles');
-    const first = loadDossierProfilesWithDiagnostics(root);
-    const cached = loadDossierProfilesWithDiagnostics(root);
+    const parse = vi.spyOn(parser, 'parseDossierProfilesWithDiagnostics');
+    const first = loadDossierSnapshot(root);
+    const cached = loadDossierSnapshot(root);
     expect(parse).toHaveBeenCalledTimes(1);
-    expect(cached.profiles).toBe(first.profiles);
-    expect(cached.diagnostics).toEqual([{ catId: 'bad', code, line: 7 }]);
-    expect(cached.profiles.has('bad')).toBe(usable);
+    expect(cached).toBe(first);
+    expect(cached.state).toBe('loaded');
+    if (cached.state !== 'loaded') throw new Error('Expected a loaded dossier snapshot');
+    expect(cached.diagnostics).toEqual([{ catId: 'bad', reason, line: 7 }]);
+    expect(cached.profiles.has('bad')).toBe(projected);
     expect(loadDossierProfiles(root)).toBe(first.profiles);
     expect(parse).toHaveBeenCalledTimes(1);
     writeFileSync(path, `${good}\n\n${good.replaceAll('good', 'bad')}`);
-    const repaired = loadDossierProfilesWithDiagnostics(root);
+    const repaired = loadDossierSnapshot(root);
     expect(parse).toHaveBeenCalledTimes(2);
-    expect(repaired.available).toBe(true);
+    expect(repaired.state).toBe('loaded');
     expect(repaired.profiles.has('bad')).toBe(true);
-    expect(repaired.diagnostics).toEqual([]);
+    expect(repaired).toMatchObject({ diagnostics: [] });
   });
 });
